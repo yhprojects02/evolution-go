@@ -222,6 +222,10 @@ func (c *chatService) HistorySyncRequest(data *HistorySyncRequestStruct, instanc
 		return nil, err
 	}
 
+	if client.Store == nil || client.Store.ID == nil {
+		return nil, errors.New("client JID is not available (not logged in)")
+	}
+
 	messageInfo := types.MessageInfo{
 		MessageSource: types.MessageSource{
 			Chat:     data.MessageInfo.Chat,
@@ -234,7 +238,7 @@ func (c *chatService) HistorySyncRequest(data *HistorySyncRequestStruct, instanc
 
 	histRequest := client.BuildHistorySyncRequest(&messageInfo, data.Count)
 
-	res, err := client.SendMessage(context.Background(), messageInfo.Chat, histRequest, whatsmeow.SendRequestExtra{Peer: true})
+	res, err := client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), histRequest, whatsmeow.SendRequestExtra{Peer: true})
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error history sync request: %v", instance.Id, err)
 		return nil, err

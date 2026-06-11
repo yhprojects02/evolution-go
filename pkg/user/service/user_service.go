@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
@@ -13,6 +14,7 @@ import (
 	"github.com/EvolutionAPI/evolution-go/pkg/utils"
 	whatsmeow_service "github.com/EvolutionAPI/evolution-go/pkg/whatsmeow/service"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -33,18 +35,29 @@ type UserService interface {
 }
 
 type userService struct {
-	clientPointer    map[string]*whatsmeow.Client
-	whatsmeowService whatsmeow_service.WhatsmeowService
-	loggerWrapper    *logger_wrapper.LoggerManager
+	clientPointer            map[string]*whatsmeow.Client
+	whatsmeowService         whatsmeow_service.WhatsmeowService
+	loggerWrapper            *logger_wrapper.LoggerManager
+	contactSyncMu            sync.Mutex
+	contactSyncInFlight      map[string]struct{}
+	contactSyncLastAttemptAt map[string]time.Time
 }
 
+const (
+	contactAppStateSyncTimeout     = 5 * time.Minute
+	contactAppStateSyncMinInterval = 5 * time.Minute
+)
+
 type ContactInfo struct {
-	Jid          string `json:"Jid"`
-	Found        bool   `json:"Found"`
-	FirstName    string `json:"FirstName"`
-	FullName     string `json:"FullName"`
-	PushName     string `json:"PushName"`
-	BusinessName string `json:"BusinessName"`
+	Jid           string `json:"Jid"`
+	Phone         string `json:"Phone,omitempty"`
+	Lid           string `json:"Lid,omitempty"`
+	RedactedPhone string `json:"RedactedPhone,omitempty"`
+	Found         bool   `json:"Found"`
+	FirstName     string `json:"FirstName"`
+	FullName      string `json:"FullName"`
+	PushName      string `json:"PushName"`
+	BusinessName  string `json:"BusinessName"`
 }
 
 type UserInfo struct {
@@ -369,6 +382,8 @@ func (u *userService) GetContacts(instance *instance_model.Instance) ([]ContactI
 		return nil, err
 	}
 
+	u.refreshContactAppState(instance.Id, client)
+
 	contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
 	if err != nil {
 		return nil, err
@@ -377,18 +392,86 @@ func (u *userService) GetContacts(instance *instance_model.Instance) ([]ContactI
 	var contactsArray []ContactInfo
 
 	for jid, contact := range contacts {
+		phone := ""
+		lid := ""
+		if jid.Server == types.DefaultUserServer {
+			phone = jid.String()
+			if client.Store.LIDs != nil {
+				if mappedLid, err := client.Store.LIDs.GetLIDForPN(context.Background(), jid); err == nil && !mappedLid.IsEmpty() {
+					lid = mappedLid.String()
+				}
+			}
+		} else if jid.Server == types.HiddenUserServer {
+			lid = jid.String()
+			if client.Store.LIDs != nil {
+				if mappedPN, err := client.Store.LIDs.GetPNForLID(context.Background(), jid); err == nil && !mappedPN.IsEmpty() {
+					phone = mappedPN.String()
+				}
+			}
+		}
+
 		contactsArray = append(contactsArray, ContactInfo{
-			Jid:          jid.String(),
-			Found:        contact.Found,
-			FirstName:    contact.FirstName,
-			FullName:     contact.FullName,
-			PushName:     contact.PushName,
-			BusinessName: contact.BusinessName,
+			Jid:           jid.String(),
+			Phone:         phone,
+			Lid:           lid,
+			RedactedPhone: contact.RedactedPhone,
+			Found:         contact.Found,
+			FirstName:     contact.FirstName,
+			FullName:      contact.FullName,
+			PushName:      contact.PushName,
+			BusinessName:  contact.BusinessName,
 		})
 	}
 
 	return contactsArray, nil
 
+}
+
+func (u *userService) refreshContactAppState(instanceID string, client *whatsmeow.Client) {
+	logger := u.loggerWrapper.GetLogger(instanceID)
+	if !u.beginContactAppStateSync(instanceID) {
+		logger.LogInfo("[%s] Contact app state sync skipped: already running or recently attempted", instanceID)
+		return
+	}
+	defer u.endContactAppStateSync(instanceID)
+
+	logger.LogInfo("[%s] Forcing critical_unblock_low app state sync to retrieve full contact list...", instanceID)
+	ctx, cancel := context.WithTimeout(context.Background(), contactAppStateSyncTimeout)
+	defer cancel()
+
+	startedAt := time.Now()
+	if err := client.FetchAppState(ctx, appstate.WAPatchCriticalUnblockLow, true, false); err != nil {
+		logger.LogWarn("[%s] App state sync warning (returning cached contacts): %v", instanceID, err)
+		return
+	}
+	logger.LogInfo("[%s] Contact app state sync completed in %s", instanceID, time.Since(startedAt).Round(time.Millisecond))
+}
+
+func (u *userService) beginContactAppStateSync(instanceID string) bool {
+	u.contactSyncMu.Lock()
+	defer u.contactSyncMu.Unlock()
+
+	if u.contactSyncInFlight == nil {
+		u.contactSyncInFlight = make(map[string]struct{})
+	}
+	if u.contactSyncLastAttemptAt == nil {
+		u.contactSyncLastAttemptAt = make(map[string]time.Time)
+	}
+	if _, ok := u.contactSyncInFlight[instanceID]; ok {
+		return false
+	}
+	if lastAttemptAt, ok := u.contactSyncLastAttemptAt[instanceID]; ok && time.Since(lastAttemptAt) < contactAppStateSyncMinInterval {
+		return false
+	}
+	u.contactSyncInFlight[instanceID] = struct{}{}
+	u.contactSyncLastAttemptAt[instanceID] = time.Now()
+	return true
+}
+
+func (u *userService) endContactAppStateSync(instanceID string) {
+	u.contactSyncMu.Lock()
+	defer u.contactSyncMu.Unlock()
+	delete(u.contactSyncInFlight, instanceID)
 }
 
 func (u *userService) GetPrivacy(instance *instance_model.Instance) (types.PrivacySettings, error) {
@@ -546,8 +629,10 @@ func NewUserService(
 	loggerWrapper *logger_wrapper.LoggerManager,
 ) UserService {
 	return &userService{
-		clientPointer:    clientPointer,
-		whatsmeowService: whatsmeowService,
-		loggerWrapper:    loggerWrapper,
+		clientPointer:            clientPointer,
+		whatsmeowService:         whatsmeowService,
+		loggerWrapper:            loggerWrapper,
+		contactSyncInFlight:      make(map[string]struct{}),
+		contactSyncLastAttemptAt: make(map[string]time.Time),
 	}
 }

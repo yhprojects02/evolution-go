@@ -351,7 +351,11 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	}
 
 	store.DeviceProps.Os = &cd.Instance.OsName
-	store.DeviceProps.RequireFullSync = proto.Bool(true)
+	// Never request a full history upload on pairing: it floods the webhook with
+	// the entire archive and keeps the phone busy uploading, which WhatsApp can
+	// treat as an active companion session. Recent context is fetched on demand
+	// via /chat/history-sync with a bounded per-conversation window instead.
+	store.DeviceProps.RequireFullSync = proto.Bool(false)
 
 	if w.config.WhatsappVersionMajor != 0 && w.config.WhatsappVersionMinor != 0 && w.config.WhatsappVersionPatch != 0 {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version to %d.%d.%d", cd.Instance.Id, w.config.WhatsappVersionMajor, w.config.WhatsappVersionMinor, w.config.WhatsappVersionPatch)
@@ -821,11 +825,11 @@ func schedulePresenceUpdates(mycli *MyClient) {
 }
 
 func processPresenceUpdates(mycli *MyClient) {
-	now := time.Now()
-	location, _ := time.LoadLocation("America/Sao_Paulo")
-	nowSp := now.In(location)
-
-	if nowSp.Hour() >= 1 && nowSp.Hour() < 24 {
+	// Keepalive presence refresh: briefly flap unavailable->available so WhatsApp
+	// keeps treating this companion as live. Skip during the local midnight hour
+	// to avoid an unnatural late-night blip. Uses server-local time, not a
+	// hardcoded region.
+	if time.Now().Hour() != 0 {
 		err := mycli.WAClient.SendPresence(context.Background(), types.PresenceUnavailable)
 		if err != nil {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to set presence as unavailable %v", mycli.userID, err)
@@ -862,69 +866,65 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 	case *events.Connected, *events.PushNameSetting:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] events.Connected to Whatsapp for user '%s'", mycli.userID, mycli.WAClient.Store.PushName)
-		if len(mycli.WAClient.Store.PushName) > 0 {
-			doWebhook = true
-			postMap["event"] = "Connected"
+		doWebhook = true
+		postMap["event"] = "Connected"
 
-			if postMap["data"] != nil {
-				jsonBytes, err := json.Marshal(postMap["data"])
-				if err != nil {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to marshal postMap['data']: %v", mycli.userID, err)
-					return
-				}
-
-				var dataMap map[string]interface{}
-				err = json.Unmarshal(jsonBytes, &dataMap)
-				if err != nil {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to unmarshal postMap['data'] to map[string]interface{}: %v", mycli.userID, err)
-					return
-				}
-
-				postMap["data"] = dataMap
-			} else {
-				postMap["data"] = make(map[string]interface{})
+		if postMap["data"] != nil {
+			jsonBytes, err := json.Marshal(postMap["data"])
+			if err != nil {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to marshal postMap['data']: %v", mycli.userID, err)
+				return
 			}
 
-			dataMap := postMap["data"].(map[string]interface{})
-
-			dataMap["status"] = "open"
-			dataMap["jid"] = mycli.WAClient.Store.ID.String()
-			dataMap["pushName"] = mycli.WAClient.Store.PushName
-
-			// jid, ok := utils.ParseJID(mycli.WAClient.Store.ID.ToNonAD().User)
-			// if ok {
-			// 	profilePicUrl, err := mycli.clientPointer[mycli.userID].GetProfilePictureInfo(jid, &whatsmeow.GetProfilePictureParams{
-			// 		Preview: false,
-			// 	})
-			// 	if err != nil {
-			// 		w.loggerWrapper.GetLogger(instanceId).LogError("[%s] Failed to get profile picture info: %v", mycli.userID, err)
-			// 	} else {
-			// 		dataMap["profilePicUrl"] = profilePicUrl.URL
-			// 	}
-			// }
+			var dataMap map[string]interface{}
+			err = json.Unmarshal(jsonBytes, &dataMap)
+			if err != nil {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to unmarshal postMap['data'] to map[string]interface{}: %v", mycli.userID, err)
+				return
+			}
 
 			postMap["data"] = dataMap
+		} else {
+			postMap["data"] = make(map[string]interface{})
+		}
 
+		dataMap := postMap["data"].(map[string]interface{})
+
+		dataMap["status"] = "open"
+		if mycli.WAClient.Store.ID != nil {
+			dataMap["jid"] = mycli.WAClient.Store.ID.String()
+		}
+		dataMap["pushName"] = mycli.WAClient.Store.PushName
+
+		postMap["data"] = dataMap
+
+		// Announcing "available" makes WhatsApp route notifications to this
+		// companion instead of the user's phone, silencing mobile alerts. Only
+		// do that when the instance explicitly opted in via AlwaysOnline;
+		// otherwise stay "unavailable" so the phone keeps notifying normally.
+		presence := types.PresenceUnavailable
+		if mycli.Instance.AlwaysOnline {
+			presence = types.PresenceAvailable
 			go schedulePresenceUpdates(mycli)
+		}
 
-			err := mycli.WAClient.SendPresence(context.Background(), types.PresenceAvailable)
-			if err != nil {
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to send available presence %v", mycli.userID, err)
-			} else {
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Marked self as available", mycli.userID)
-			}
+		err := mycli.WAClient.SendPresence(context.Background(), presence)
+		if err != nil {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to send %s presence %v", mycli.userID, presence, err)
+		} else {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Marked self as %s", mycli.userID, presence)
+		}
 
-			mycli.Instance.Connected = true
-			mycli.Instance.DisconnectReason = ""
-			err = mycli.instanceRepository.UpdateConnected(mycli.Instance.Id, mycli.Instance.Connected, mycli.Instance.DisconnectReason)
-			if err != nil {
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
-			}
+		mycli.Instance.Connected = true
+		mycli.Instance.DisconnectReason = ""
+		err = mycli.instanceRepository.UpdateConnected(mycli.Instance.Id, mycli.Instance.Connected, mycli.Instance.DisconnectReason)
+		if err != nil {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
+		}
 
-			err = mycli.instanceRepository.UpdateQrcode(mycli.Instance.Id, "")
-			if err != nil {
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
-			}
+		err = mycli.instanceRepository.UpdateQrcode(mycli.Instance.Id, "")
+		if err != nil {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
 	case *events.PairSuccess:
 		doWebhook = true
@@ -1045,17 +1045,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] ===== MESSAGE RECEIVED ===== ID: %s, From: %s, Type: %s, Size: %s", mycli.userID, evt.Info.ID, evt.Info.Chat.String(), evt.Info.Type, messageSize)
-
-		// se readMessages for true ele marca como lida
-		if mycli.Instance.ReadMessages {
-			messageIDs := []string{evt.Info.ID}
-			err := mycli.WAClient.MarkRead(context.Background(), messageIDs, time.Now(), evt.Info.Sender, evt.Info.Sender)
-			if err != nil {
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to auto-mark message as read: %v", mycli.userID, err)
-			} else {
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Auto-marked message as read from %s", mycli.userID, evt.Info.Chat.String())
-			}
-		}
 
 		// se ignoreStatus for true e o chat for broadcast ou o id for broadcast retorna
 		if mycli.Instance.IgnoreStatus && (strings.Contains(evt.Info.Chat.String(), "@broadcast") || strings.Contains(evt.Info.ID, "@broadcast")) {
@@ -1703,10 +1692,96 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Chat archived", mycli.userID)
 	case *events.HistorySync:
-		doWebhook = true
-		postMap["event"] = "HistorySync"
+		syncType := evt.Data.GetSyncType().String()
+		chunkOrder := evt.Data.GetChunkOrder()
+		progress := evt.Data.GetProgress()
+		conversations := evt.Data.GetConversations()
+		totalConversations := len(conversations)
 
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] History sync event received %+v", mycli.userID, evt.Data.SyncType)
+		totalMessages := 0
+		for _, conv := range conversations {
+			totalMessages += len(conv.GetMessages())
+		}
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] HistorySync type=%s conversations=%d messages=%d chunkOrder=%d progress=%d",
+			mycli.userID, syncType, totalConversations, totalMessages, chunkOrder, progress)
+
+		const maxPayloadBytes = 100 * 1024 // 100 KB per webhook call
+		const maxMsgsPerChunk = 50
+
+		dispatchHistoryChunk := func(data map[string]interface{}) {
+			payload := map[string]interface{}{
+				"event":         "HistorySync",
+				"instanceToken": mycli.token,
+				"instanceId":    mycli.userID,
+				"instanceName":  mycli.Instance.Name,
+				"data":          data,
+			}
+			values, err := json.Marshal(payload)
+			if err != nil {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] HistorySync chunk marshal failed: %v", mycli.userID, err)
+				return
+			}
+			queueName := strings.ToLower(fmt.Sprintf("%s.historysync", mycli.userID))
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] HistorySync chunk dispatched size=%d bytes", mycli.userID, len(values))
+			go mycli.service.CallWebhook(mycli.Instance, queueName, values)
+			if mycli.config.AmqpGlobalEnabled || mycli.config.NatsGlobalEnabled {
+				go mycli.service.SendToGlobalQueues("HistorySync", values, mycli.userID)
+			}
+		}
+
+		if totalConversations == 0 {
+			postMap["event"] = "HistorySync"
+			postMap["data"] = map[string]interface{}{
+				"syncType":          syncType,
+				"chunkOrder":        chunkOrder,
+				"progress":          progress,
+				"conversationCount": 0,
+				"messageCount":      0,
+			}
+			doWebhook = true
+		} else {
+			for i, conv := range conversations {
+				messages := conv.GetMessages()
+				// Try sending the full conversation
+				fullData := map[string]interface{}{
+					"syncType":          syncType,
+					"chunkOrder":        chunkOrder,
+					"progress":          progress,
+					"conversationIndex": i,
+					"conversationTotal": totalConversations,
+					"conversationId":    conv.GetID(),
+					"messageCount":      len(messages),
+					"conversation":      conv,
+				}
+				probe, err := json.Marshal(fullData)
+				if err == nil && len(probe) <= maxPayloadBytes {
+					dispatchHistoryChunk(fullData)
+					continue
+				}
+				// Conversation too large — chunk messages
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] HistorySync conversation %s large, splitting into message chunks", mycli.userID, conv.GetID())
+				totalMsgChunks := (len(messages) + maxMsgsPerChunk - 1) / maxMsgsPerChunk
+				for j := 0; j < len(messages); j += maxMsgsPerChunk {
+					end := j + maxMsgsPerChunk
+					if end > len(messages) {
+						end = len(messages)
+					}
+					dispatchHistoryChunk(map[string]interface{}{
+						"syncType":          syncType,
+						"chunkOrder":        chunkOrder,
+						"progress":          progress,
+						"conversationIndex": i,
+						"conversationTotal": totalConversations,
+						"conversationId":    conv.GetID(),
+						"messageCount":      len(messages),
+						"msgChunkIndex":     j / maxMsgsPerChunk,
+						"msgChunkTotal":     totalMsgChunks,
+						"messages":          messages[j:end],
+					})
+				}
+			}
+			doWebhook = false
+		}
 	case *events.AppState:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] App state event received %+v", mycli.userID, evt)
 	case *events.LoggedOut:
@@ -2664,7 +2739,11 @@ func NewWhatsmeowService(
 	loggerWrapper *logger_wrapper.LoggerManager,
 ) WhatsmeowService {
 	// Inicializar PollService de forma segura
-	pollSvc := poll_service.NewPollService(authDB, loggerWrapper)
+	var pollDB *sql.DB = authDB
+	if pollDB == nil {
+		pollDB = sqliteDB
+	}
+	pollSvc := poll_service.NewPollService(pollDB, loggerWrapper)
 
 	return &whatsmeowService{
 		instanceRepository: instanceRepository,

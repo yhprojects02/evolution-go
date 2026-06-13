@@ -31,6 +31,7 @@ type MessageService interface {
 	GetMessageStatus(data *MessageStatusStruct, instance *instance_model.Instance) (*message_model.Message, string, error)
 	DeleteMessageEveryone(data *MessageStruct, instance *instance_model.Instance) (string, string, error)
 	EditMessage(data *EditMessageStruct, instance *instance_model.Instance) (string, string, error)
+	SubscribePresence(data *SubscribePresenceStruct, instance *instance_model.Instance) error
 }
 
 type messageService struct {
@@ -52,6 +53,10 @@ type ChatPresenceStruct struct {
 	Number  string `json:"number"`
 	State   string `json:"state"`
 	IsAudio bool   `json:"isAudio"`
+}
+
+type SubscribePresenceStruct struct {
+	Number string `json:"number"`
 }
 
 type MarkReadStruct struct {
@@ -233,6 +238,36 @@ func (m *messageService) ChatPresence(data *ChatPresenceStruct, instance *instan
 	m.loggerWrapper.GetLogger(instance.Id).LogInfo("Message sent to %s", data.Number)
 
 	return ts.String(), nil
+}
+
+// SubscribePresence asks the WhatsApp server to start delivering presence
+// (online/offline/last-seen) and chat-presence (typing/recording) updates for a
+// contact. The server only sends these to clients that are themselves marked
+// available, so we send our own available presence first. Mirrors what
+// WhatsApp Web does when you open a conversation.
+func (m *messageService) SubscribePresence(data *SubscribePresenceStruct, instance *instance_model.Instance) error {
+	client, err := m.ensureClientConnected(instance.Id)
+	if err != nil {
+		return err
+	}
+
+	recipient, ok := utils.ParseJID(data.Number)
+	if !ok {
+		m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error validating presence subscribe number", instance.Id)
+		return errors.New("invalid phone number")
+	}
+
+	// Must be "available" for the server to push others' presence to us.
+	if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+		m.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] SendPresence(available) failed: %v", instance.Id, err)
+	}
+
+	if err := client.SubscribePresence(context.Background(), recipient); err != nil {
+		return err
+	}
+
+	m.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Subscribed to presence of %s", instance.Id, data.Number)
+	return nil
 }
 
 func (m *messageService) MarkRead(data *MarkReadStruct, instance *instance_model.Instance) (string, error) {

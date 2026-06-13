@@ -150,6 +150,7 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 		{
 			routes.POST("/react", r.jidValidationMiddleware.ValidateJIDFields("number"), r.messageHandler.React)
 			routes.POST("/presence", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.ChatPresence)
+			routes.POST("/subscribe-presence", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.SubscribePresence)
 			routes.POST("/markread", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.MarkRead)
 			routes.POST("/downloadmedia", r.messageHandler.DownloadMedia)
 			routes.POST("/status", r.messageHandler.GetMessageStatus)

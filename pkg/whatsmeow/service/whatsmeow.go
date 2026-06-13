@@ -1032,6 +1032,33 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "Message"
 		// Message received
 
+		// Encrypted edit: newer WhatsApp delivers message edits as a
+		// SecretEncryptedMessage (the new text is E2E-encrypted with the original
+		// message's secret) instead of a plain protocolMessage. Decrypt it here
+		// and re-wrap as a standard MESSAGE_EDIT protocolMessage so the rest of
+		// the pipeline (and downstream webhook consumers) treat it like any edit.
+		if encEdit := evt.Message.GetSecretEncryptedMessage(); encEdit != nil && encEdit.GetTargetMessageKey() != nil {
+			decryptCtx, cancelDecrypt := context.WithTimeout(context.Background(), 10*time.Second)
+			decrypted, decErr := mycli.WAClient.DecryptSecretEncryptedMessage(decryptCtx, evt)
+			cancelDecrypt()
+			if decErr != nil {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt secret edit %s: %v", mycli.userID, evt.Info.ID, decErr)
+			} else if decrypted != nil {
+				evt.Message = &waE2E.Message{
+					ProtocolMessage: &waE2E.ProtocolMessage{
+						Key:           encEdit.GetTargetMessageKey(),
+						Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+						EditedMessage: decrypted,
+					},
+				}
+				evt.IsEdit = true
+				if evt.Info.Edit == "" {
+					evt.Info.Edit = types.EditAttributeMessageEdit
+				}
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Decrypted secret edit for original %s", mycli.userID, encEdit.GetTargetMessageKey().GetID())
+			}
+		}
+
 		// Log message arrival with detailed info
 		messageSize := "unknown"
 		if evt.Message.GetDocumentMessage() != nil && evt.Message.GetDocumentMessage().FileLength != nil {

@@ -1196,6 +1196,23 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 				}
 
+				// Forward the decrypted vote in the webhook so downstream clients
+				// can render live tallies. Options are SHA-256 hashes (hex); the
+				// consumer maps them back by hashing the poll's option texts.
+				selectedHashes := make([]string, len(decrypted.SelectedOptions))
+				for i, option := range decrypted.SelectedOptions {
+					selectedHashes[i] = fmt.Sprintf("%x", option)
+				}
+				votePollKey := evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey()
+				dataMap["pollVote"] = map[string]interface{}{
+					"pollId":         votePollKey.GetID(),
+					"voterJid":       evt.Info.Sender.String(),
+					"voterPhone":     evt.Info.Sender.User,
+					"voterName":      evt.Info.PushName,
+					"selectedHashes": selectedHashes,
+					"timestamp":      evt.Info.Timestamp.Unix(),
+				}
+
 				// NOVO: Salvar voto no banco de dados de forma NÃO-INVASIVA
 				if mycli.pollService != nil {
 					go func() {
@@ -1593,17 +1610,17 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			buttonClickMap := map[string]interface{}{
 				"event": "ButtonClick",
 				"data": map[string]interface{}{
-					"buttonId":     buttonClickData["buttonId"],
-					"buttonText":   buttonClickData["buttonText"],
-					"type":         buttonClickData["type"],
-					"phone":        dataMap["Sender"],
-					"jid":          dataMap["Sender"],
-					"pushName":     dataMap["PushName"],
-					"messageId":    dataMap["ID"],
-					"chat":         dataMap["Chat"],
-					"fromMe":       dataMap["FromMe"],
-					"timestamp":    evt.Info.Timestamp.Unix(),
-					"extraData":    buttonClickData,
+					"buttonId":   buttonClickData["buttonId"],
+					"buttonText": buttonClickData["buttonText"],
+					"type":       buttonClickData["type"],
+					"phone":      dataMap["Sender"],
+					"jid":        dataMap["Sender"],
+					"pushName":   dataMap["PushName"],
+					"messageId":  dataMap["ID"],
+					"chat":       dataMap["Chat"],
+					"fromMe":     dataMap["FromMe"],
+					"timestamp":  evt.Info.Timestamp.Unix(),
+					"extraData":  buttonClickData,
 				},
 				"instanceToken": mycli.token,
 				"instanceId":    mycli.userID,

@@ -12,6 +12,8 @@ type MessageHandler interface {
 	React(ctx *gin.Context)
 	ChatPresence(ctx *gin.Context)
 	SubscribePresence(ctx *gin.Context)
+	SelfPresence(ctx *gin.Context)
+	VotePoll(ctx *gin.Context)
 	MarkRead(ctx *gin.Context)
 	DownloadMedia(ctx *gin.Context)
 	GetMessageStatus(ctx *gin.Context)
@@ -156,6 +158,51 @@ func (m *messageHandler) SubscribePresence(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "success"})
+}
+
+// SelfPresence sets our global availability (opt-in; available silences phone)
+func (m *messageHandler) SelfPresence(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+	var data *message_service.SelfPresenceStruct
+	if err := ctx.ShouldBindBodyWithJSON(&data); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := m.messageService.SetSelfPresence(data.Available, instance); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"message": "success"})
+}
+
+// VotePoll casts a vote on a poll
+func (m *messageHandler) VotePoll(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+	var data *message_service.VotePollStruct
+	if err := ctx.ShouldBindBodyWithJSON(&data); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if data.PollMessageID == "" || len(data.Options) == 0 {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "pollMessageId and options are required"})
+		return
+	}
+	id, err := m.messageService.VotePoll(data, instance)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": gin.H{"id": id}})
 }
 
 // MarkRead mark a message as read

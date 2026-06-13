@@ -32,6 +32,8 @@ type MessageService interface {
 	DeleteMessageEveryone(data *MessageStruct, instance *instance_model.Instance) (string, string, error)
 	EditMessage(data *EditMessageStruct, instance *instance_model.Instance) (string, string, error)
 	SubscribePresence(data *SubscribePresenceStruct, instance *instance_model.Instance) error
+	SetSelfPresence(available bool, instance *instance_model.Instance) error
+	VotePoll(data *VotePollStruct, instance *instance_model.Instance) (string, error)
 }
 
 type messageService struct {
@@ -57,6 +59,16 @@ type ChatPresenceStruct struct {
 
 type SubscribePresenceStruct struct {
 	Number string `json:"number"`
+}
+
+type SelfPresenceStruct struct {
+	Available bool `json:"available"`
+}
+
+type VotePollStruct struct {
+	Number        string   `json:"number"`
+	PollMessageID string   `json:"pollMessageId"`
+	Options       []string `json:"options"`
 }
 
 type MarkReadStruct struct {
@@ -257,17 +269,62 @@ func (m *messageService) SubscribePresence(data *SubscribePresenceStruct, instan
 		return errors.New("invalid phone number")
 	}
 
-	// Must be "available" for the server to push others' presence to us.
-	if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
-		m.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] SendPresence(available) failed: %v", instance.Id, err)
-	}
-
+	// IMPORTANT: do NOT send available presence here. Announcing available makes
+	// WhatsApp route notifications to this companion and silences the phone. The
+	// caller must opt in explicitly via SetSelfPresence(true) first; this only
+	// subscribes (a no-op for receiving until the client is available).
 	if err := client.SubscribePresence(context.Background(), recipient); err != nil {
 		return err
 	}
 
 	m.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Subscribed to presence of %s", instance.Id, data.Number)
 	return nil
+}
+
+// SetSelfPresence flips our global availability. available=true lets us receive
+// others' presence/typing BUT silences the phone's notifications (WhatsApp
+// routes them to the active companion). available=false restores the phone.
+// Presence in the web client is therefore strictly opt-in.
+func (m *messageService) SetSelfPresence(available bool, instance *instance_model.Instance) error {
+	client, err := m.ensureClientConnected(instance.Id)
+	if err != nil {
+		return err
+	}
+	state := types.PresenceUnavailable
+	if available {
+		state = types.PresenceAvailable
+	}
+	if err := client.SendPresence(context.Background(), state); err != nil {
+		return err
+	}
+	m.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Self presence set to %s", instance.Id, state)
+	return nil
+}
+
+// VotePoll casts/updates this account's vote on a poll. optionNames must match
+// the poll's option texts exactly (whatsmeow hashes them).
+func (m *messageService) VotePoll(data *VotePollStruct, instance *instance_model.Instance) (string, error) {
+	client, err := m.ensureClientConnected(instance.Id)
+	if err != nil {
+		return "", err
+	}
+	chat, ok := utils.ParseJID(data.Number)
+	if !ok {
+		return "", errors.New("invalid chat jid")
+	}
+	pollInfo := &types.MessageInfo{
+		ID:            data.PollMessageID,
+		MessageSource: types.MessageSource{Chat: chat},
+	}
+	voteMsg, err := client.BuildPollVote(context.Background(), pollInfo, data.Options)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.SendMessage(context.Background(), chat, voteMsg)
+	if err != nil {
+		return "", err
+	}
+	return resp.ID, nil
 }
 
 func (m *messageService) MarkRead(data *MarkReadStruct, instance *instance_model.Instance) (string, error) {

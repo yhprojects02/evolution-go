@@ -69,6 +69,8 @@ type VotePollStruct struct {
 	Number        string   `json:"number"`
 	PollMessageID string   `json:"pollMessageId"`
 	Options       []string `json:"options"`
+	Sender        string   `json:"sender"` // JID of the poll's creator (needed for the message secret)
+	FromMe        bool     `json:"fromMe"` // true if WE created the poll
 }
 
 type MarkReadStruct struct {
@@ -312,9 +314,24 @@ func (m *messageService) VotePoll(data *VotePollStruct, instance *instance_model
 	if !ok {
 		return "", errors.New("invalid chat jid")
 	}
+	// The poll's message secret is stored under (chat, creatorJID, pollID). Build
+	// MessageInfo with the real creator so the lookup succeeds. Fall back to the
+	// chat JID for a 1:1 poll when no explicit sender is given.
+	sender := chat
+	if data.Sender != "" {
+		if parsed, ok2 := utils.ParseJID(data.Sender); ok2 {
+			sender = parsed
+		}
+	}
+	isGroup := chat.Server == types.GroupServer
 	pollInfo := &types.MessageInfo{
-		ID:            data.PollMessageID,
-		MessageSource: types.MessageSource{Chat: chat},
+		ID: data.PollMessageID,
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			Sender:   sender,
+			IsFromMe: data.FromMe,
+			IsGroup:  isGroup,
+		},
 	}
 	voteMsg, err := client.BuildPollVote(context.Background(), pollInfo, data.Options)
 	if err != nil {

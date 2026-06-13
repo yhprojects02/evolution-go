@@ -1188,8 +1188,46 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 			decrypted, err := mycli.clientPointer[mycli.userID].DecryptPollVote(context.Background(), evt)
 			if err != nil {
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt vote: %v", mycli.userID, err)
-			} else {
+				// The poll's message secret is stored under the phone JID, but the
+				// vote often arrives with the @lid Chat form → secret lookup misses.
+				// Retry with the Chat normalized to the phone JID.
+				origChat := evt.Info.Chat
+				origSender := evt.Info.Sender
+				retried := false
+				if evt.Info.Chat.Server == types.HiddenUserServer {
+					// Prefer SenderAlt (phone form) then Sender if it's a phone.
+					var phoneChat types.JID
+					if evt.Info.SenderAlt.Server == types.DefaultUserServer {
+						phoneChat = evt.Info.SenderAlt
+					} else if evt.Info.Sender.Server == types.DefaultUserServer {
+						phoneChat = evt.Info.Sender
+					}
+					if !phoneChat.IsEmpty() {
+						evt.Info.Chat = phoneChat
+						if evt.Info.Sender.Server == types.HiddenUserServer && evt.Info.SenderAlt.Server == types.DefaultUserServer {
+							evt.Info.Sender = evt.Info.SenderAlt
+						}
+						retried = true
+						decrypted, err = mycli.clientPointer[mycli.userID].DecryptPollVote(context.Background(), evt)
+					}
+				}
+				if err != nil {
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt vote (retried=%v): %v", mycli.userID, retried, err)
+					// Forward the failure + JID details so the SaaS layer can log
+					// exactly why decryption missed (temporary diagnostic).
+					dataMap["pollVoteError"] = map[string]interface{}{
+						"error":     err.Error(),
+						"chat":      origChat.String(),
+						"sender":    origSender.String(),
+						"senderAlt": evt.Info.SenderAlt.String(),
+						"pollKeyId": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetID(),
+						"keyFromMe": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetFromMe(),
+						"keyRemote": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetRemoteJID(),
+						"keyPartic": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetParticipant(),
+					}
+				}
+			}
+			if err == nil && decrypted != nil {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Selected options in decrypted vote:", mycli.userID)
 				for _, option := range decrypted.SelectedOptions {
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("- %X", option)

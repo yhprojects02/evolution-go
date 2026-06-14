@@ -1249,6 +1249,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					"voterJid":       evt.Info.Sender.String(),
 					"voterPhone":     evt.Info.Sender.User,
 					"voterName":      evt.Info.PushName,
+					"fromMe":         pristineInfo.IsFromMe,
 					"selectedHashes": selectedHashes,
 					"timestamp":      evt.Info.Timestamp.Unix(),
 				}

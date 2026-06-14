@@ -1183,6 +1183,17 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			dataMap = make(map[string]interface{})
 		}
 
+		// For a poll CREATION, expose the PRISTINE (pre-swap) chat/sender so the
+		// SaaS layer can store them and later cast a vote with the exact JID forms
+		// WhatsApp expects (the PollCreationMessageKey must match the original).
+		if evt.Message.GetPollCreationMessage() != nil || evt.Message.GetPollCreationMessageV2() != nil || evt.Message.GetPollCreationMessageV3() != nil {
+			dataMap["pollMeta"] = map[string]interface{}{
+				"chat":   pristineInfo.Chat.String(),
+				"sender": pristineInfo.Sender.String(),
+				"fromMe": pristineInfo.IsFromMe,
+			}
+		}
+
 		if evt.Message.GetPollUpdateMessage() != nil {
 			fmt.Printf("[POLL DEBUG] 🎯 PollUpdateMessage detected!\n")
 			fmt.Printf("[POLL DEBUG] � BEFORE accessing evt.Info - Sender: %s, Server: %s\n", evt.Info.Sender.String(), evt.Info.Sender.Server)

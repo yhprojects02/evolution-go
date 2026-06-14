@@ -66,11 +66,12 @@ type SelfPresenceStruct struct {
 }
 
 type VotePollStruct struct {
-	Number        string   `json:"number"`
+	Number        string   `json:"number"` // deliverable chat JID (where to SEND the vote)
 	PollMessageID string   `json:"pollMessageId"`
 	Options       []string `json:"options"`
-	Sender        string   `json:"sender"` // JID of the poll's creator (needed for the message secret)
-	FromMe        bool     `json:"fromMe"` // true if WE created the poll
+	PollChat      string   `json:"pollChat"` // pristine chat JID of the poll (for key/secret)
+	Sender        string   `json:"sender"`   // pristine creator JID (for the message secret)
+	FromMe        bool     `json:"fromMe"`   // true if WE created the poll
 }
 
 type MarkReadStruct struct {
@@ -310,34 +311,40 @@ func (m *messageService) VotePoll(data *VotePollStruct, instance *instance_model
 	if err != nil {
 		return "", err
 	}
-	chat, ok := utils.ParseJID(data.Number)
+	// Delivery target: where the vote message is actually SENT (must be a
+	// reachable chat JID — the phone form, not @lid).
+	deliveryJID, ok := utils.ParseJID(data.Number)
 	if !ok {
 		return "", errors.New("invalid chat jid")
 	}
-	// The poll's message secret is stored under (chat, creatorJID, pollID). Build
-	// MessageInfo with the real creator so the lookup succeeds. Fall back to the
-	// chat JID for a 1:1 poll when no explicit sender is given.
-	sender := chat
+	// Key/secret derivation: use the PRISTINE poll JIDs so the
+	// PollCreationMessageKey matches the original (and the secret resolves).
+	pollChat := deliveryJID
+	if data.PollChat != "" {
+		if parsed, ok2 := utils.ParseJID(data.PollChat); ok2 {
+			pollChat = parsed
+		}
+	}
+	sender := pollChat
 	if data.Sender != "" {
 		if parsed, ok2 := utils.ParseJID(data.Sender); ok2 {
 			sender = parsed
 		}
 	}
-	isGroup := chat.Server == types.GroupServer
 	pollInfo := &types.MessageInfo{
 		ID: data.PollMessageID,
 		MessageSource: types.MessageSource{
-			Chat:     chat,
+			Chat:     pollChat,
 			Sender:   sender,
 			IsFromMe: data.FromMe,
-			IsGroup:  isGroup,
+			IsGroup:  pollChat.Server == types.GroupServer,
 		},
 	}
 	voteMsg, err := client.BuildPollVote(context.Background(), pollInfo, data.Options)
 	if err != nil {
 		return "", err
 	}
-	resp, err := client.SendMessage(context.Background(), chat, voteMsg)
+	resp, err := client.SendMessage(context.Background(), deliveryJID, voteMsg)
 	if err != nil {
 		return "", err
 	}

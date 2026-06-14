@@ -1032,6 +1032,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "Message"
 		// Message received
 
+		// Snapshot the ORIGINAL message info before the LID<->phone JID swap below
+		// mutates it. Poll-vote decryption derives its key from the exact JID
+		// forms WhatsApp used to encrypt — decrypting after the swap fails GCM
+		// auth. We decrypt the vote against this pristine copy further down.
+		pristineInfo := evt.Info
+
 		// Encrypted edit: newer WhatsApp delivers message edits as a
 		// SecretEncryptedMessage (the new text is E2E-encrypted with the original
 		// message's secret) instead of a plain protocolMessage. Decrypt it here
@@ -1186,45 +1192,30 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				fmt.Printf("[POLL DEBUG] ✅ mycli.WAClient is initialized: %s\n", mycli.WAClient.Store.ID)
 			}
 
-			decrypted, err := mycli.clientPointer[mycli.userID].DecryptPollVote(context.Background(), evt)
+			// Decrypt against the PRISTINE event (original JID forms, pre-swap) —
+			// the vote's GCM key is derived from the exact JIDs WhatsApp used.
+			pristineEvt := &events.Message{
+				Info:       pristineInfo,
+				Message:    evt.Message,
+				RawMessage: evt.RawMessage,
+			}
+			decrypted, err := mycli.clientPointer[mycli.userID].DecryptPollVote(context.Background(), pristineEvt)
 			if err != nil {
-				// The poll's message secret is stored under the phone JID, but the
-				// vote often arrives with the @lid Chat form → secret lookup misses.
-				// Retry with the Chat normalized to the phone JID.
-				origChat := evt.Info.Chat
-				origSender := evt.Info.Sender
-				retried := false
-				if evt.Info.Chat.Server == types.HiddenUserServer {
-					// Prefer SenderAlt (phone form) then Sender if it's a phone.
-					var phoneChat types.JID
-					if evt.Info.SenderAlt.Server == types.DefaultUserServer {
-						phoneChat = evt.Info.SenderAlt
-					} else if evt.Info.Sender.Server == types.DefaultUserServer {
-						phoneChat = evt.Info.Sender
-					}
-					if !phoneChat.IsEmpty() {
-						evt.Info.Chat = phoneChat
-						if evt.Info.Sender.Server == types.HiddenUserServer && evt.Info.SenderAlt.Server == types.DefaultUserServer {
-							evt.Info.Sender = evt.Info.SenderAlt
-						}
-						retried = true
-						decrypted, err = mycli.clientPointer[mycli.userID].DecryptPollVote(context.Background(), evt)
-					}
-				}
-				if err != nil {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt vote (retried=%v): %v", mycli.userID, retried, err)
-					// Forward the failure + JID details so the SaaS layer can log
-					// exactly why decryption missed (temporary diagnostic).
-					dataMap["pollVoteError"] = map[string]interface{}{
-						"error":     err.Error(),
-						"chat":      origChat.String(),
-						"sender":    origSender.String(),
-						"senderAlt": evt.Info.SenderAlt.String(),
-						"pollKeyId": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetID(),
-						"keyFromMe": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetFromMe(),
-						"keyRemote": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetRemoteJID(),
-						"keyPartic": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetParticipant(),
-					}
+				// Fall back to the swapped event in case the pristine form misses.
+				decrypted, err = mycli.clientPointer[mycli.userID].DecryptPollVote(context.Background(), evt)
+			}
+			if err != nil {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt vote: %v", mycli.userID, err)
+				dataMap["pollVoteError"] = map[string]interface{}{
+					"error":     err.Error(),
+					"pChat":     pristineInfo.Chat.String(),
+					"pSender":   pristineInfo.Sender.String(),
+					"pAlt":      pristineInfo.SenderAlt.String(),
+					"chat":      evt.Info.Chat.String(),
+					"sender":    evt.Info.Sender.String(),
+					"pollKeyId": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetID(),
+					"keyFromMe": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetFromMe(),
+					"keyRemote": evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetRemoteJID(),
 				}
 			}
 			if err == nil && decrypted != nil {

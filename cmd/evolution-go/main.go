@@ -36,6 +36,7 @@ import (
 	websocket_producer "github.com/EvolutionAPI/evolution-go/pkg/events/websocket"
 	group_handler "github.com/EvolutionAPI/evolution-go/pkg/group/handler"
 	group_service "github.com/EvolutionAPI/evolution-go/pkg/group/service"
+	instance_cleanup "github.com/EvolutionAPI/evolution-go/pkg/instance/cleanup"
 	instance_handler "github.com/EvolutionAPI/evolution-go/pkg/instance/handler"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	instance_repository "github.com/EvolutionAPI/evolution-go/pkg/instance/repository"
@@ -81,7 +82,7 @@ func init() {
 	}
 }
 
-func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.Config, conn *amqp.Connection, exPath string, runtimeCtx *core.RuntimeContext) *gin.Engine {
+func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.Config, conn *amqp.Connection, exPath string, runtimeCtx *core.RuntimeContext) *gin.Engine {
 	killChannel := make(map[string](chan bool))
 	clientPointer := make(map[string]*whatsmeow.Client)
 
@@ -239,6 +240,16 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	if config.ConnectOnStartup {
 		go whatsmeowService.ConnectOnStartup(config.ClientName)
 	}
+
+	disconnectedCleaner, err := instance_cleanup.New(
+		instanceService,
+		instance_cleanup.DefaultRetention,
+		instance_cleanup.DefaultInterval,
+	)
+	if err != nil {
+		logger.LogFatal("Failed to initialize disconnected instance cleanup: %v", err)
+	}
+	go disconnectedCleaner.Run(ctx)
 
 	r.GET("/ws", func(c *gin.Context) {
 		token := c.Query("token")
@@ -400,13 +411,13 @@ func main() {
 		logger.LogInfo("RabbitMQ URL not configured, skipping RabbitMQ connection")
 	}
 
-	r := setupRouter(db, authDB, sqliteDB, cfg, conn, exPath, runtimeCtx)
+	// The heartbeat and background maintenance workers share the same lifecycle.
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
 
-	// Graceful shutdown with heartbeat
-	heartbeatCtx, heartbeatCancel := context.WithCancel(context.Background())
-	defer heartbeatCancel()
+	r := setupRouter(appCtx, db, authDB, sqliteDB, cfg, conn, exPath, runtimeCtx)
 
-	core.StartHeartbeat(heartbeatCtx, runtimeCtx, startTime)
+	core.StartHeartbeat(appCtx, runtimeCtx, startTime)
 
 	srv := &http.Server{
 		Addr:    ":" + os.Getenv("SERVER_PORT"),
@@ -427,7 +438,7 @@ func main() {
 	logger.LogInfo("[SHUTDOWN] Signal received, shutting down...")
 
 	// Stop heartbeat loop
-	heartbeatCancel()
+	appCancel()
 
 	core.Shutdown(runtimeCtx)
 

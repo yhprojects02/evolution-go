@@ -2,6 +2,7 @@ package instance_repository
 
 import (
 	"fmt"
+	"time"
 
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	"github.com/gomessguii/logger"
@@ -23,6 +24,8 @@ type InstanceRepository interface {
 	GetInstanceByName(name string) (*instance_model.Instance, error)
 	Update(*instance_model.Instance) error
 	UpdateConnected(userId string, status bool, disconnectReason string) error
+	InitializeDisconnectedTracking(now time.Time, clientName string) (int64, error)
+	GetDisconnectedBefore(cutoff time.Time, clientName string) ([]*instance_model.Instance, error)
 	UpdateQrcode(userId string, qr string) error
 	UpdateProxy(userId string, proxy string) error
 	UpdateJid(userId string, jid string) error
@@ -41,6 +44,10 @@ type instanceRepository struct {
 }
 
 func (i *instanceRepository) Create(instance instance_model.Instance) (*instance_model.Instance, error) {
+	if !instance.Connected && instance.DisconnectedAt == nil {
+		now := time.Now().UTC()
+		instance.DisconnectedAt = &now
+	}
 	if err := i.db.Create(&instance).Error; err != nil {
 		return nil, err
 	}
@@ -93,6 +100,12 @@ func (i *instanceRepository) GetConnectedInstanceByID(instanceId string) (*insta
 }
 
 func (i *instanceRepository) Update(instance *instance_model.Instance) error {
+	if instance.Connected {
+		instance.DisconnectedAt = nil
+	} else if instance.DisconnectedAt == nil {
+		now := time.Now().UTC()
+		instance.DisconnectedAt = &now
+	}
 	err := i.db.Save(&instance).Error
 	if err != nil {
 		logger.LogError("Error updating instance in DB: %v", err)
@@ -101,7 +114,40 @@ func (i *instanceRepository) Update(instance *instance_model.Instance) error {
 }
 
 func (i *instanceRepository) UpdateConnected(userId string, status bool, disconnectReason string) error {
-	return i.db.Model(&instance_model.Instance{}).Where("id = ?", userId).Update("connected", status).Update("disconnect_reason", disconnectReason).Error
+	updates := map[string]interface{}{
+		"connected":         status,
+		"disconnect_reason": disconnectReason,
+	}
+	if status {
+		updates["disconnected_at"] = nil
+	} else {
+		updates["disconnected_at"] = gorm.Expr("COALESCE(disconnected_at, ?)", time.Now().UTC())
+	}
+	return i.db.Model(&instance_model.Instance{}).Where("id = ?", userId).Updates(updates).Error
+}
+
+func (i *instanceRepository) InitializeDisconnectedTracking(now time.Time, clientName string) (int64, error) {
+	query := i.db.Model(&instance_model.Instance{}).
+		Where("connected = ? AND disconnected_at IS NULL", false)
+	if clientName != "" {
+		query = query.Where("client_name = ?", clientName)
+	}
+	result := query.Update("disconnected_at", now.UTC())
+	return result.RowsAffected, result.Error
+}
+
+func (i *instanceRepository) GetDisconnectedBefore(cutoff time.Time, clientName string) ([]*instance_model.Instance, error) {
+	var instances []*instance_model.Instance
+	query := i.db.
+		Where("connected = ? AND disconnected_at IS NOT NULL AND disconnected_at <= ?", false, cutoff.UTC()).
+		Order("disconnected_at ASC")
+	if clientName != "" {
+		query = query.Where("client_name = ?", clientName)
+	}
+	if err := query.Find(&instances).Error; err != nil {
+		return nil, err
+	}
+	return instances, nil
 }
 
 func (i *instanceRepository) UpdateQrcode(userId string, qr string) error {

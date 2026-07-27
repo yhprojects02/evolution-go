@@ -44,6 +44,7 @@ type InstanceService interface {
 	GetLogs(instanceId string, startDate, endDate time.Time, level string, limit int) ([]logger_wrapper.LogEntry, error)
 	GetAdvancedSettings(instanceId string) (*instance_model.AdvancedSettings, error)
 	UpdateAdvancedSettings(instanceId string, settings *instance_model.AdvancedSettings) error
+	CleanupExpiredDisconnected(now time.Time, retention time.Duration) (CleanupResult, error)
 }
 
 type instances struct {
@@ -112,6 +113,12 @@ type SetProxyStruct struct {
 
 type ForceReconnectStruct struct {
 	Number string `json:"number"`
+}
+
+type CleanupResult struct {
+	TrackingInitialized int64
+	Deleted             int
+	Failed              int
 }
 
 func (i *instances) ensureClientConnected(instanceId string) (*whatsmeow.Client, error) {
@@ -548,6 +555,76 @@ func (i instances) Delete(id string) error {
 	}
 
 	return nil
+}
+
+func (i instances) CleanupExpiredDisconnected(now time.Time, retention time.Duration) (CleanupResult, error) {
+	result := CleanupResult{}
+	if retention <= 0 {
+		return result, fmt.Errorf("disconnected instance retention must be positive")
+	}
+
+	initialized, err := i.instanceRepository.InitializeDisconnectedTracking(now, i.config.ClientName)
+	if err != nil {
+		return result, fmt.Errorf("initialize disconnected tracking: %w", err)
+	}
+	result.TrackingInitialized = initialized
+
+	cutoff := now.UTC().Add(-retention)
+	candidates, err := i.instanceRepository.GetDisconnectedBefore(cutoff, i.config.ClientName)
+	if err != nil {
+		return result, fmt.Errorf("list expired disconnected instances: %w", err)
+	}
+
+	var cleanupErrors []error
+	for _, candidate := range candidates {
+		if candidate == nil || !isExpiredDisconnected(candidate, cutoff) {
+			continue
+		}
+
+		// The persisted flag can briefly lag behind the live WhatsApp client.
+		// Never delete a client that is already connected or logged in; repair
+		// the stored state instead so its seven-day clock is cleared.
+		if client := i.clientPointer[candidate.Id]; client != nil && (client.IsConnected() || client.IsLoggedIn()) {
+			if err := i.instanceRepository.UpdateConnected(candidate.Id, true, ""); err != nil {
+				result.Failed++
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("repair connected instance %s: %w", candidate.Id, err))
+			}
+			continue
+		}
+
+		// Re-read immediately before the destructive operation. A reconnect
+		// event may have cleared disconnected_at after the candidate query.
+		current, err := i.instanceRepository.GetInstanceByID(candidate.Id)
+		if err != nil {
+			result.Failed++
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("recheck instance %s: %w", candidate.Id, err))
+			continue
+		}
+		if !isExpiredDisconnected(current, cutoff) {
+			continue
+		}
+
+		if err := i.Delete(current.Id); err != nil {
+			result.Failed++
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete disconnected instance %s: %w", current.Id, err))
+			continue
+		}
+		result.Deleted++
+		i.loggerWrapper.GetLogger(current.Id).LogInfo(
+			"[%s] Automatically deleted after being disconnected since %s",
+			current.Id,
+			current.DisconnectedAt.UTC().Format(time.RFC3339),
+		)
+	}
+
+	return result, errors.Join(cleanupErrors...)
+}
+
+func isExpiredDisconnected(instance *instance_model.Instance, cutoff time.Time) bool {
+	return instance != nil &&
+		!instance.Connected &&
+		instance.DisconnectedAt != nil &&
+		!instance.DisconnectedAt.After(cutoff)
 }
 
 func (i instances) SetProxy(id string, proxyConfig *ProxyConfig) error {

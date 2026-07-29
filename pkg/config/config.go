@@ -182,9 +182,11 @@ func (c *Config) CreateUsersDB() (*gorm.DB, error) {
 		return nil, fmt.Errorf("erro ao obter sql.DB do GORM: %v", err)
 	}
 
-	// Configurar pool de conexões para evitar conexões ociosas não fechadas
-	sqlDB.SetMaxOpenConns(25)                 // Máximo de 25 conexões abertas simultaneamente
-	sqlDB.SetMaxIdleConns(5)                  // Máximo de 5 conexões ociosas no pool
+	// Supabase is a shared managed PostgreSQL service. Keep the two Evolution Go
+	// pools deliberately small so Auth + user persistence cannot exhaust the
+	// project's available database connections.
+	sqlDB.SetMaxOpenConns(5)
+	sqlDB.SetMaxIdleConns(2)
 	sqlDB.SetConnMaxLifetime(5 * time.Minute) // Reconectar após 5 minutos para evitar timeouts
 	sqlDB.SetConnMaxIdleTime(1 * time.Minute) // Fechar conexões ociosas após 1 minuto
 
@@ -192,9 +194,12 @@ func (c *Config) CreateUsersDB() (*gorm.DB, error) {
 }
 
 func (c *Config) CreateAuthDB() (*sql.DB, error) {
-	dbDSN := c.postgresUsersDB
+	dbDSN := c.PostgresAuthDB
 
-	if c.postgresUsersDB == "" {
+	// Fall back on the field actually being used: keying this off
+	// postgresUsersDB meant an empty auth DSN was passed through whenever the
+	// users DSN happened to be set.
+	if c.PostgresAuthDB == "" {
 		dbDSN = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable", c.PostgresHost, c.PostgresPort, c.PostgresUser, c.PostgresPassword, c.PostgresDB)
 	}
 
@@ -207,9 +212,9 @@ func (c *Config) CreateAuthDB() (*sql.DB, error) {
 		return nil, err
 	}
 
-	// Configurar pool de conexões para evitar conexões ociosas não fechadas
-	db.SetMaxOpenConns(25)                 // Máximo de 25 conexões abertas simultaneamente
-	db.SetMaxIdleConns(5)                  // Máximo de 5 conexões ociosas no pool
+	// See CreateUsersDB: this process can open both Auth and user pools.
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
 	db.SetConnMaxLifetime(5 * time.Minute) // Reconectar após 5 minutos para evitar timeouts
 	db.SetConnMaxIdleTime(1 * time.Minute) // Fechar conexões ociosas após 1 minuto
 

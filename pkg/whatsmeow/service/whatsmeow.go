@@ -385,6 +385,20 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
+	// DeviceProps.Version is only the companion metadata we advertise. The
+	// connect handshake sends store.GetWAVersion(), which stays at the value
+	// hardcoded in store/clientpayload.go unless SetWAVersion is called — so
+	// without this, resolving the current version above changed nothing and
+	// WhatsApp answered every reconnect with "Client outdated (405)". Existing
+	// sockets survive a version deprecation; the next reconnect does not.
+	if version.Major != 0 && version.Minor != 0 && version.Patch != 0 {
+		store.SetWAVersion(store.WAVersionContainer{
+			uint32(version.Major), uint32(version.Minor), uint32(version.Patch),
+		})
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo(
+			"[%s] Handshake version set to %s", cd.Instance.Id, store.GetWAVersion().String())
+	}
+
 	// 🔒 FIX: Sempre criar logger, mesmo que WaDebug esteja vazio
 	// Usar "INFO" como nível mínimo para garantir que logs importantes apareçam
 	minLevel := w.config.WaDebug
@@ -486,15 +500,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Already logged in with JID: %s", cd.Instance.Id, client.Store.ID.String())
 		err = client.Connect()
 		if err != nil {
-			if strings.Contains(err.Error(), "EOF") {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Erro de conexão WebSocket (EOF). Tentando reconectar em 5 segundos...", cd.Instance.Id)
-				time.Sleep(5 * time.Second)
-				err = client.Connect()
-				if err != nil {
-					w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Falha na segunda tentativa de conexão: %v", cd.Instance.Id, err)
-					return
-				}
-			} else if strings.Contains(err.Error(), "username/password authentication failed") {
+			if strings.Contains(err.Error(), "username/password authentication failed") {
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Proxy authentication failed, attempting to connect without proxy", cd.Instance.Id)
 
 				// Desabilita o proxy
@@ -508,8 +514,26 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				}
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Successfully connected without proxy", cd.Instance.Id)
 			} else {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to connect: %v", cd.Instance.Id, err)
-				return
+				// Transient network errors (EOF, connection reset, DNS blips on the
+				// VPS/tunnel link) used to give up after exactly one retry, stranding
+				// an already-paired instance "disconnected" until a human noticed and
+				// manually rescanned the QR. Retry with backoff instead — most drops
+				// are transient and self-heal within this window.
+				backoffs := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second}
+				connectErr := err
+				for attempt, delay := range backoffs {
+					w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Connect attempt %d failed: %v. Retrying in %s...", cd.Instance.Id, attempt+1, connectErr, delay)
+					time.Sleep(delay)
+					connectErr = client.Connect()
+					if connectErr == nil {
+						break
+					}
+				}
+				if connectErr != nil {
+					w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Giving up after %d connect attempts: %v", cd.Instance.Id, len(backoffs)+1, connectErr)
+					return
+				}
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Reconnected after retry", cd.Instance.Id)
 			}
 		}
 	} else {

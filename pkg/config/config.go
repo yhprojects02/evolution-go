@@ -155,8 +155,21 @@ func (c *Config) CreateUsersDB() (*gorm.DB, error) {
 		logger.LogWarn("[CONFIG] Auto-setup failed (will try connecting anyway): %v", err)
 	}
 
+	// PreferSimpleProtocol stops pgx from using implicit prepared statements.
+	// Supabase's transaction pooler (port 6543) hands a different backend to
+	// each transaction, so a cached statement name is repeatedly re-declared and
+	// the query dies with `prepared statement "stmtcache_..." already exists`
+	// (SQLSTATE 42P05). That surfaced as an unreadable `instances` table: the
+	// token lookup returned zero rows and the engine answered every send with
+	// `401 not authorized` while the token was in fact valid.
+	//
+	// Simple protocol works on the session pooler too, so this holds whichever
+	// port the deployment env happens to carry.
 	db, err := gorm.Open(
-		postgres.Open(dbDSN),
+		postgres.New(postgres.Config{
+			DSN:                  dbDSN,
+			PreferSimpleProtocol: true,
+		}),
 		&gorm.Config{},
 	)
 	if err != nil {

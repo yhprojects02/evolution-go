@@ -412,7 +412,70 @@ func Load() *Config {
 		loadMinioConfig(config)
 	}
 
+	warnIfTransactionPooler(config_env.POSTGRES_AUTH_DB, config.PostgresAuthDB)
+	warnIfTransactionPooler(config_env.POSTGRES_USERS_DB, config.postgresUsersDB)
+
 	return config
+}
+
+// SupabaseTransactionPoolerPort is PgBouncer in TRANSACTION pooling mode.
+// Supabase serves session pooling on 5432 and transaction pooling on 6543.
+const SupabaseTransactionPoolerPort = "6543"
+
+// IsTransactionPoolerDSN reports whether a Postgres DSN points at a connection
+// pooler running in transaction mode.
+//
+// This driver (lib/pq) speaks the extended query protocol and reuses the
+// UNNAMED prepared statement for every query. Transaction pooling multiplexes
+// client connections onto shared server connections between transactions, so a
+// Parse issued for one query and the Bind that follows it can land on different
+// server connections. The result is cross-talk between unrelated statements:
+//
+//	pq: bind message supplies 3 parameters, but prepared statement "" requires 2
+//	pq: unnamed prepared statement does not exist
+//
+// WhatsMeow writes identity keys, signal sessions and app-state keys
+// concurrently during the initial sync, which is exactly when this fires. The
+// damage is silent and severe: app-state keys never persist (so the chat list
+// never arrives), and peer messages cannot be encrypted (so history sync
+// requests never leave the engine).
+//
+// Session pooling (port 5432) keeps one server connection per client connection
+// for its whole life and is the supported endpoint for this driver.
+func IsTransactionPoolerDSN(dsn string) bool {
+	trimmed := strings.TrimSpace(dsn)
+	if trimmed == "" {
+		return false
+	}
+
+	if strings.HasPrefix(trimmed, "postgres://") || strings.HasPrefix(trimmed, "postgresql://") {
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return false
+		}
+		return u.Port() == SupabaseTransactionPoolerPort
+	}
+
+	// key=value DSN form: port=6543
+	for _, field := range strings.Fields(trimmed) {
+		if strings.EqualFold(field, "port="+SupabaseTransactionPoolerPort) {
+			return true
+		}
+	}
+	return false
+}
+
+func warnIfTransactionPooler(name, dsn string) {
+	if !IsTransactionPoolerDSN(dsn) {
+		return
+	}
+	logger.LogWarn(
+		"[CONFIG] %s points at port %s, the TRANSACTION pooler. This driver reuses the unnamed prepared statement, "+
+			"which transaction pooling corrupts: expect \"bind message supplies N parameters\" and \"unnamed prepared "+
+			"statement does not exist\" errors, app-state keys that never persist (empty chat list) and history sync "+
+			"requests that never reach WhatsApp. Use the session pooler on port 5432 instead.",
+		name, SupabaseTransactionPoolerPort,
+	)
 }
 
 func loadMinioConfig(config *Config) {

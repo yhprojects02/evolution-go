@@ -69,6 +69,10 @@ type clientVersion struct {
 	Patch int
 }
 
+func shouldRequestInitialHistorySync(instance *instance_model.Instance) bool {
+	return instance != nil && strings.TrimSpace(instance.Jid) == ""
+}
+
 type whatsmeowService struct {
 	instanceRepository instance_repository.InstanceRepository
 	authDB             *sql.DB
@@ -351,11 +355,14 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	}
 
 	store.DeviceProps.Os = &cd.Instance.OsName
-	// Never request a full history upload on pairing: it floods the webhook with
-	// the entire archive and keeps the phone busy uploading, which WhatsApp can
-	// treat as an active companion session. Recent context is fetched on demand
-	// via /chat/history-sync with a bounded per-conversation window instead.
-	store.DeviceProps.RequireFullSync = proto.Bool(false)
+	// A newly linked companion must receive the initial history sync: WhatsApp's
+	// contact store only contains saved address-book entries, while the sidebar
+	// must also include chats with unsaved numbers and inactive group threads.
+	// The Middleware persists only its bounded message window plus a preview per
+	// conversation, and splits webhook payloads, so this does not retain the full
+	// archive in the SaaS database. Already-linked companions do not request a
+	// second full upload when they reconnect.
+	store.DeviceProps.RequireFullSync = proto.Bool(shouldRequestInitialHistorySync(cd.Instance))
 
 	if w.config.WhatsappVersionMajor != 0 && w.config.WhatsappVersionMinor != 0 && w.config.WhatsappVersionPatch != 0 {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version to %d.%d.%d", cd.Instance.Id, w.config.WhatsappVersionMajor, w.config.WhatsappVersionMinor, w.config.WhatsappVersionPatch)

@@ -17,7 +17,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gomessguii/logger"
 	"github.com/joho/godotenv"
-	"go.mau.fi/whatsmeow"
 	"gorm.io/gorm"
 	_ "modernc.org/sqlite"
 
@@ -54,6 +53,7 @@ import (
 	newsletter_handler "github.com/EvolutionAPI/evolution-go/pkg/newsletter/handler"
 	newsletter_service "github.com/EvolutionAPI/evolution-go/pkg/newsletter/service"
 	poll_handler "github.com/EvolutionAPI/evolution-go/pkg/poll/handler"
+	"github.com/EvolutionAPI/evolution-go/pkg/registry"
 	routes "github.com/EvolutionAPI/evolution-go/pkg/routes"
 	send_handler "github.com/EvolutionAPI/evolution-go/pkg/sendMessage/handler"
 	send_service "github.com/EvolutionAPI/evolution-go/pkg/sendMessage/service"
@@ -83,8 +83,8 @@ func init() {
 }
 
 func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.Config, conn *amqp.Connection, exPath string, runtimeCtx *core.RuntimeContext) *gin.Engine {
-	killChannel := make(map[string](chan bool))
-	clientPointer := make(map[string]*whatsmeow.Client)
+	killChannel := registry.NewKillChannels()
+	clientPointer := registry.NewClients()
 
 	loggerWrapper := logger_wrapper.NewLoggerManager(config)
 
@@ -240,6 +240,11 @@ func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql
 	if config.ConnectOnStartup {
 		go whatsmeowService.ConnectOnStartup(config.ClientName)
 	}
+
+	// Keep linked numbers linked. ConnectOnStartup only runs once, so anything
+	// that dropped afterwards — a ConnectFailure, a client goroutine that
+	// exited, a database blip during boot — stayed down until a human noticed.
+	go whatsmeowService.SuperviseInstances(ctx, config.ClientName, whatsmeow_service.SupervisorInterval)
 
 	disconnectedCleaner, err := instance_cleanup.New(
 		instanceService,

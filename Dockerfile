@@ -1,14 +1,27 @@
-FROM golang:1.25.0-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.25.0-alpine AS build
 
-# CI builds this image for linux/amd64 on an aarch64 runner, so the Go
-# toolchain runs under qemu-user. Go's signal-based async preemption is what
-# makes it crash there with errors like `fatal error: lfstack.push`; disabling
-# preemption is the standard workaround and costs nothing on a native build.
-# The binary itself needs cgo (libjpeg-turbo, libwebp), so this stage cannot be
-# cross-compiled the way a pure-Go one would be.
-ENV GODEBUG=asyncpreemptoff=1
+# CI runs on an aarch64 runner while this image ships for linux/amd64. Running
+# the Go toolchain through qemu-user is not an option — it dies immediately with
+# `fatal error: taggedPointerPack` (and `lfstack.push` on older Go), because the
+# runtime's tagged-pointer and preemption assumptions do not hold under
+# emulation. So the build stage stays native and cross-compiles instead.
+#
+# The binary needs cgo for github.com/chai2010/webp, which vendors libwebp's C
+# source rather than linking a system library, so all that is required is a C
+# cross-compiler — zig provides one for every musl target in a single package,
+# and its output links against musl, matching the alpine runtime stage below.
+ARG TARGETARCH
+RUN apk update && apk add --no-cache git zig
 
-RUN apk update && apk add --no-cache git build-base libjpeg-turbo-dev libwebp-dev
+RUN case "$TARGETARCH" in \
+      amd64) triple=x86_64-linux-musl ;; \
+      arm64) triple=aarch64-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && printf '#!/bin/sh\nexec zig cc -target %s "$@"\n' "$triple" > /usr/local/bin/xcc \
+    && chmod +x /usr/local/bin/xcc
+
+ENV CGO_ENABLED=1 GOOS=linux GOARCH=$TARGETARCH CC=/usr/local/bin/xcc
 
 WORKDIR /build
 
@@ -25,7 +38,7 @@ RUN go mod download
 COPY . .
 
 ARG VERSION=dev
-RUN CGO_ENABLED=1 go build -ldflags "-X main.version=${VERSION}" -o server ./cmd/evolution-go
+RUN go build -ldflags "-X main.version=${VERSION}" -o server ./cmd/evolution-go
 
 FROM alpine:3.19.1 AS final
 

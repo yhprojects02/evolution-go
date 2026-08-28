@@ -95,6 +95,17 @@ func TestKillChannelResetStartsANewGeneration(t *testing.T) {
 	}
 }
 
+func TestKillChannelLookupDoesNotResurrectDeletedGeneration(t *testing.T) {
+	kills := NewKillChannels()
+	kills.Reset("instance")
+	kills.Signal("instance")
+	kills.Delete("instance")
+
+	if _, ok := kills.Lookup("instance"); ok {
+		t.Fatal("Lookup found a kill channel after deletion")
+	}
+}
+
 func TestSignalReportsWhetherAChannelExisted(t *testing.T) {
 	kills := NewKillChannels()
 	if kills.Signal("missing") {

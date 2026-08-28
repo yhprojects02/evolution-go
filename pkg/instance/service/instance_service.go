@@ -83,6 +83,10 @@ type ConnectStruct struct {
 	RabbitmqEnable  string   `json:"rabbitmqEnable"`
 	WebSocketEnable string   `json:"websocketEnable"`
 	NatsEnable      string   `json:"natsEnable"`
+	// AllowNewDevice is an explicit opt-in for a caller that is beginning a
+	// login. It intentionally defaults to false so webhook and presence
+	// reconfiguration calls cannot create a new WhatsApp companion.
+	AllowNewDevice bool `json:"allowNewDevice"`
 }
 
 type StatusStruct struct {
@@ -272,9 +276,10 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 			Subscriptions: subscribedEvents,
 			Phone:         data.Phone,
 			IsProxy:       false,
-			// /instance/connect is how a login begins, so this is the one path
-			// allowed to register a new companion device.
-			AllowNewDevice: true,
+			// /instance/connect is also used for webhook and presence updates.
+			// Only a caller that explicitly begins a login may register a new
+			// companion device; an omitted JSON field therefore remains safe.
+			AllowNewDevice: data.AllowNewDevice,
 		}
 
 		if instance.Proxy != "" || i.config.ProxyHost != "" {
@@ -664,11 +669,19 @@ func (i instances) Delete(id string) error {
 		return err
 	}
 
-	if i.clientPointer.Get(instance.Id) != nil && i.clientPointer.Get(instance.Id).IsConnected() {
-		if i.clientPointer.Get(instance.Id).IsLoggedIn() {
-			i.clientPointer.Get(instance.Id).Logout(context.Background())
+	client := i.clientPointer.Get(instance.Id)
+	if client != nil {
+		if client.IsLoggedIn() {
+			client.Logout(context.Background())
+		} else {
+			// Wake the QR receiver before disconnecting the socket. Otherwise
+			// the socket can close its QR channel first and the loop may publish
+			// one last timeout/webhook before seeing deletion.
+			i.killChannel.Signal(instance.Id)
 		}
-		i.clientPointer.Get(instance.Id).Disconnect()
+		if client.IsConnected() {
+			client.Disconnect()
+		}
 	}
 
 	// Limpar todos os recursos da instância antes de deletar

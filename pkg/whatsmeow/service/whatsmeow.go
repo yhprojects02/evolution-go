@@ -150,6 +150,28 @@ type ClientData struct {
 	AllowNewDevice bool
 }
 
+type deviceStoreContainer interface {
+	GetDevice(context.Context, types.JID) (*store.Device, error)
+	NewDevice() *store.Device
+}
+
+// loadDeviceStore selects the persisted device for a reconnect, or creates a
+// new device only for a deliberate login when the instance has no JID. A
+// non-empty JID is always looked up first; if its credentials are gone, the
+// caller's explicit-login decision is handled by StartClient's existing
+// relink branch. Returning nil when new devices are disallowed deliberately
+// flows into StartClient's relink-required refusal.
+func loadDeviceStore(ctx context.Context, container deviceStoreContainer, instance *instance_model.Instance, allowNewDevice bool) (*store.Device, error) {
+	if strings.TrimSpace(instance.Jid) != "" {
+		jid, _ := utils.ParseJID(instance.Jid)
+		return container.GetDevice(ctx, jid)
+	}
+	if !allowNewDevice {
+		return nil, nil
+	}
+	return container.NewDevice(), nil
+}
+
 type Values struct {
 	m map[string]string
 }
@@ -299,12 +321,39 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	// This runs as a bare goroutine. Without a recover, one panic on one
 	// instance — a malformed payload, a nil field in an unfamiliar event —
 	// takes the process down and disconnects every other linked number with it.
-	defer w.recoverGoroutine(cd.Instance.Id, "StartClient")
+	if cd == nil || cd.Instance == nil {
+		return
+	}
+	instanceID := cd.Instance.Id
+	defer w.recoverGoroutine(instanceID, "StartClient")
+
+	// StartClient is launched asynchronously. Re-read the row before doing any
+	// work so a restart cannot reuse the stale Instance pointer from the login
+	// generation, and a late goroutine cannot start an instance deleted in the
+	// meantime.
+	instance, err := w.instanceRepository.GetInstanceByID(instanceID)
+	if err != nil {
+		w.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Instance no longer exists; abandoning late client start", instanceID)
+		return
+	}
+	cd.Instance = instance
+
+	// Every production start path installs a generation before launching this
+	// goroutine. Lookup must not use Ensure here: Ensure would resurrect an open
+	// channel after DELETE removed the old generation.
+	stop, ok := w.killChannel.Lookup(instanceID)
+	if !ok {
+		w.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] No live kill channel; abandoning stale client start", instanceID)
+		return
+	}
+	if stopRequested(stop) {
+		w.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Client start was already stopped; abandoning stale client start", instanceID)
+		return
+	}
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
 
 	var deviceStore *store.Device
-	var err error
 
 	if existing := w.clientPointer.Get(cd.Instance.Id); existing != nil {
 		if existing.IsConnected() {
@@ -345,17 +394,17 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		return
 	}
 
-	if cd.Instance.Jid != "" {
+	if strings.TrimSpace(cd.Instance.Jid) != "" {
 		jid, _ := utils.ParseJID(cd.Instance.Jid)
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Jid found. Getting device store for jid: %s", cd.Instance.Id, jid)
-		deviceStore, err = container.GetDevice(context.Background(), jid)
-		if err != nil {
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Erro ao obter device store: %v", cd.Instance.Id, err)
-			return
-		}
 	} else {
-		w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] No jid found. Creating new device", cd.Instance.Id)
-		deviceStore = container.NewDevice()
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] No jid found. Checking whether a new device is allowed", cd.Instance.Id)
+	}
+
+	deviceStore, err = loadDeviceStore(context.Background(), container, cd.Instance, cd.AllowNewDevice)
+	if err != nil {
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Erro ao obter device store: %v", cd.Instance.Id, err)
+		return
 	}
 
 	if deviceStore == nil {
@@ -364,9 +413,15 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		// successful reconnect while actually starting a silent re-pairing, so
 		// only a deliberate login is allowed to do it.
 		if !cd.AllowNewDevice {
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError(
-				"[%s] Device credentials for %s are gone — WhatsApp unlinked this companion. Not re-pairing on a reconnect; the number must be linked again.",
-				cd.Instance.Id, cd.Instance.Jid)
+			if strings.TrimSpace(cd.Instance.Jid) == "" {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError(
+					"[%s] Reconnect has no persisted JID. Refusing to create a new device; the number must be linked again deliberately.",
+					cd.Instance.Id)
+			} else {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError(
+					"[%s] Device credentials for %s are gone — WhatsApp unlinked this companion. Not re-pairing on a reconnect; the number must be linked again.",
+					cd.Instance.Id, cd.Instance.Jid)
+			}
 			updater, ok := w.instanceRepository.(instance_repository.ConditionalConnectedUpdater)
 			if !ok {
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Instance repository does not support conditional relink updates", cd.Instance.Id)
@@ -640,7 +695,15 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				}
 			}
 
-			for evt := range qrChan {
+			for {
+				evt, channelOpen, stopped := nextQRChannelItem(stop, qrChan)
+				if stopped {
+					w.stopClientWithoutWebhook(cd, client, mycli)
+					return
+				}
+				if !channelOpen {
+					break
+				}
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Received QR code event %s", cd.Instance.Id, evt.Event)
 				if evt.Event == "code" {
 					// Incrementar contador de QR codes
@@ -673,12 +736,18 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 							w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error clearing QR code: %v", cd.Instance.Id, err)
 						}
 
-						// 3. Atualizar status da instância como desconectada
+						// 3. Atualizar status da instância como desconectada, without
+						// replacing a more specific reason that arrived first.
 						cd.Instance.Connected = false
-						cd.Instance.DisconnectReason = fmt.Sprintf("QR code limit reached (%d)", w.config.QrcodeMaxCount)
-						err = w.instanceRepository.UpdateConnected(cd.Instance.Id, false, cd.Instance.DisconnectReason)
-						if err != nil {
-							w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance status: %v", cd.Instance.Id, err)
+						qrLimitReason := fmt.Sprintf("QR code limit reached (%d)", w.config.QrcodeMaxCount)
+						cd.Instance.DisconnectReason = qrLimitReason
+						if updater, ok := w.instanceRepository.(instance_repository.ConditionalConnectedUpdater); ok {
+							err = updater.UpdateConnectedIfReasonEmptyOrGeneric(cd.Instance.Id, qrLimitReason)
+							if err != nil {
+								w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance status: %v", cd.Instance.Id, err)
+							}
+						} else {
+							w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Instance repository does not support conditional QR-limit updates", cd.Instance.Id)
 						}
 
 						// 4. Limpar recursos
@@ -835,11 +904,6 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	// Removed auto-reconnect logic to prevent infinite loops
 
-	// Capture the stop signal once. Re-reading it every iteration would let a
-	// teardown that deletes the channel be followed by a fresh one, and this
-	// loop would then wait on a signal nobody will ever send.
-	stop := w.killChannel.Ensure(cd.Instance.Id)
-
 	for {
 		select {
 		case <-stop:
@@ -892,14 +956,63 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
 			}
 
-			// restart client
+			// Restart through the normal reconnect entrypoint. It re-reads the
+			// repository row, resets the kill generation, and refuses to start
+			// if DELETE already removed the instance.
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
-			w.StartClient(cd)
+			if err := w.StartInstance(cd.Instance.Id); err != nil {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Not restarting client: %v", cd.Instance.Id, err)
+			}
 			return
 		default:
 			time.Sleep(1000 * time.Millisecond)
 		}
 	}
+}
+
+// nextQRChannelItem waits for either the next QR event or the existing
+// close-based instance stop signal. The two stop checks make a deletion win
+// over a QR event that was already buffered when the signal arrived.
+func nextQRChannelItem(stop <-chan struct{}, qrChan <-chan whatsmeow.QRChannelItem) (whatsmeow.QRChannelItem, bool, bool) {
+	if stopRequested(stop) {
+		return whatsmeow.QRChannelItem{}, false, true
+	}
+
+	select {
+	case <-stop:
+		return whatsmeow.QRChannelItem{}, false, true
+	case evt, ok := <-qrChan:
+		select {
+		case <-stop:
+			return whatsmeow.QRChannelItem{}, false, true
+		default:
+		}
+		return evt, ok, false
+	}
+}
+
+func stopRequested(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w whatsmeowService) stopClientWithoutWebhook(cd *ClientData, client *whatsmeow.Client, mycli *MyClient) {
+	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Received kill signal while waiting for QR; stopping without dispatch", cd.Instance.Id)
+	if client != nil && mycli != nil && mycli.eventHandlerID != 0 {
+		client.RemoveEventHandler(mycli.eventHandlerID)
+	}
+	if client != nil {
+		client.Disconnect()
+		w.clientPointer.DeleteIf(cd.Instance.Id, client)
+	}
+	if mycli != nil {
+		w.myClientPointer.DeleteIf(cd.Instance.Id, mycli)
+	}
+	w.userInfoCache.Delete(cd.Instance.Token)
 }
 
 func schedulePresenceUpdates(mycli *MyClient) {
@@ -1120,6 +1233,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		instance.Connected = true
 		instance.DisconnectReason = ""
 		instance.Jid = mycli.WAClient.Store.ID.String()
+		// PairSuccess loaded a fresh repository object above. Keep the object
+		// owned by the live client in sync too; otherwise a later kill/restart
+		// would carry the empty JID from the original login request.
+		mycli.Instance.Jid = instance.Jid
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Updating JID: %s in Instance: %s", mycli.userID, mycli.WAClient.Store.ID.String(), instance.Jid)
 

@@ -2,11 +2,16 @@ package instance_service
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/EvolutionAPI/evolution-go/pkg/config"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	instance_repository "github.com/EvolutionAPI/evolution-go/pkg/instance/repository"
+	logger_wrapper "github.com/EvolutionAPI/evolution-go/pkg/logger"
+	"github.com/EvolutionAPI/evolution-go/pkg/registry"
+	whatsmeow_service "github.com/EvolutionAPI/evolution-go/pkg/whatsmeow/service"
 )
 
 type createInstanceRepositoryStub struct {
@@ -72,4 +77,70 @@ func TestCreateFallsBackToConfiguredOSNameWhenAbsent(t *testing.T) {
 		t.Fatalf("created OsName = %q, want %q", created.OsName, "Configured OS")
 	}
 	assertCreatedOSName(t, repository, "Configured OS")
+}
+
+type connectInstanceRepositoryStub struct {
+	instance_repository.InstanceRepository
+}
+
+func (r *connectInstanceRepositoryStub) Update(*instance_model.Instance) error {
+	return nil
+}
+
+type connectWhatsmeowServiceStub struct {
+	whatsmeow_service.WhatsmeowService
+	started chan *whatsmeow_service.ClientData
+}
+
+func (s *connectWhatsmeowServiceStub) UpdateInstanceSettings(string) error {
+	return errors.New("instance is not running")
+}
+
+func (s *connectWhatsmeowServiceStub) StartClient(data *whatsmeow_service.ClientData) {
+	s.started <- data
+}
+
+func TestConnectRequiresExplicitAllowNewDeviceOptIn(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{name: "omitted field is safe", payload: `{}`, want: false},
+		{name: "explicit login opt-in", payload: `{"allowNewDevice":true}`, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var data ConnectStruct
+			if err := json.Unmarshal([]byte(tt.payload), &data); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+
+			started := make(chan *whatsmeow_service.ClientData, 1)
+			service := instances{
+				instanceRepository: &connectInstanceRepositoryStub{},
+				config:             &config.Config{LogDirectory: t.TempDir()},
+				killChannel:        registry.NewKillChannels(),
+				clientPointer:      registry.NewClients(),
+				whatsmeowService:   &connectWhatsmeowServiceStub{started: started},
+				loggerWrapper:      logger_wrapper.NewLoggerManager(&config.Config{LogDirectory: t.TempDir()}),
+				loginLocks:         newKeyedMutex(),
+			}
+			instance := &instance_model.Instance{Id: "connect-opt-in-test"}
+
+			if _, _, _, err := service.Connect(&data, instance); err != nil {
+				t.Fatalf("Connect() error = %v", err)
+			}
+
+			select {
+			case clientData := <-started:
+				if clientData.AllowNewDevice != tt.want {
+					t.Fatalf("ClientData.AllowNewDevice = %v, want %v", clientData.AllowNewDevice, tt.want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Connect() did not start the client")
+			}
+		})
+	}
 }

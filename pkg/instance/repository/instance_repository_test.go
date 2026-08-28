@@ -123,6 +123,43 @@ func TestUpdateConnectedIfReasonEmptyOrGenericWritesGenericReasonWhenEmpty(t *te
 	}
 }
 
+func TestUpdateConnectedIfReasonEmptyOrGenericPreservesSpecificReasonFromQRLimit(t *testing.T) {
+	db, sqlDB := newInstanceRepositoryTestDB(t)
+	repository := NewInstanceRepository(db)
+	updater, ok := repository.(ConditionalConnectedUpdater)
+	if !ok {
+		t.Fatal("instance repository does not implement ConditionalConnectedUpdater")
+	}
+
+	const instanceID = "instance-qr-limit"
+	const qrLimitReason = "QR code limit reached (5)"
+	const specificReason = "401: logged out from another device"
+	if _, err := sqlDB.Exec(
+		`INSERT INTO instances (id, connected, disconnect_reason) VALUES (?, ?, ?)`,
+		instanceID,
+		true,
+		specificReason,
+	); err != nil {
+		t.Fatalf("insert instance error = %v", err)
+	}
+
+	if err := updater.UpdateConnectedIfReasonEmptyOrGeneric(instanceID, qrLimitReason); err != nil {
+		t.Fatalf("UpdateConnectedIfReasonEmptyOrGeneric() error = %v", err)
+	}
+
+	var reason string
+	var connected bool
+	if err := sqlDB.QueryRow(`SELECT disconnect_reason, connected FROM instances WHERE id = ?`, instanceID).Scan(&reason, &connected); err != nil {
+		t.Fatalf("query instance error = %v", err)
+	}
+	if reason != specificReason {
+		t.Fatalf("disconnect_reason = %q, want specific reason preserved", reason)
+	}
+	if connected {
+		t.Fatal("connected = true, want false after QR-limit update")
+	}
+}
+
 func TestAppendDisconnectEventCapsRowsPerInstance(t *testing.T) {
 	db, sqlDB := newInstanceRepositoryTestDB(t)
 	repository := NewInstanceRepository(db)

@@ -153,6 +153,20 @@ func (k *KillChannels) Ensure(id string) <-chan struct{} {
 	return entry.ch
 }
 
+// Lookup returns the stop channel for id without creating a new generation.
+// Start paths that install a generation before launching an asynchronous
+// client use this to distinguish a real start from a late goroutine belonging
+// to an instance that has already been deleted.
+func (k *KillChannels) Lookup(id string) (<-chan struct{}, bool) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	entry, ok := k.m[id]
+	if !ok || entry == nil {
+		return nil, false
+	}
+	return entry.ch, true
+}
+
 func (k *KillChannels) Delete(id string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()

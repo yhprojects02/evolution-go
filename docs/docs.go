@@ -3665,6 +3665,9 @@ const docTemplate = `{
         "github_com_EvolutionAPI_evolution-go_pkg_instance_service.ConnectStruct": {
             "type": "object",
             "properties": {
+                "allowNewDevice": {
+                    "type": "boolean"
+                },
                 "immediate": {
                     "type": "boolean"
                 },

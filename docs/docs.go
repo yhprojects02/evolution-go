@@ -1064,7 +1064,7 @@ const docTemplate = `{
         },
         "/instance/create": {
             "post": {
-                "description": "Creates a new instance with the provided data including optional advanced settings",
+                "description": "Creates a new instance with the provided data including optional os_name and advanced settings",
                 "consumes": [
                     "application/json"
                 ],
@@ -1077,7 +1077,7 @@ const docTemplate = `{
                 "summary": "Create a new instance",
                 "parameters": [
                     {
-                        "description": "Instance data with optional advanced settings",
+                        "description": "Instance data with optional os_name and advanced settings",
                         "name": "instance",
                         "in": "body",
                         "required": true,
@@ -3701,6 +3701,9 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "name": {
+                    "type": "string"
+                },
+                "os_name": {
                     "type": "string"
                 },
                 "proxy": {

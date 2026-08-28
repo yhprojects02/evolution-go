@@ -70,6 +70,7 @@ type CreateStruct struct {
 	InstanceId       string                           `json:"instanceId"`
 	Name             string                           `json:"name"`
 	Token            string                           `json:"token"`
+	OsName           string                           `json:"os_name"`
 	Proxy            *ProxyConfig                     `json:"proxy"`
 	AdvancedSettings *instance_model.AdvancedSettings `json:"advancedSettings"`
 }
@@ -179,11 +180,16 @@ func (i instances) Create(data *CreateStruct) (*instance_model.Instance, error) 
 		return nil, fmt.Errorf("instance already exists")
 	}
 
+	osName := data.OsName
+	if osName == "" {
+		osName = i.config.OsName
+	}
+
 	instance := instance_model.Instance{
 		Id:         data.InstanceId,
 		Name:       data.Name,
 		Token:      data.Token,
-		OsName:     i.config.OsName,
+		OsName:     osName,
 		Proxy:      string(proxyJson),
 		Connected:  false,
 		ClientName: i.config.ClientName,

@@ -284,7 +284,7 @@ func (p *rabbitMQProducer) CreateGlobalQueues() error {
 			"HISTORY_SYNC":  {"historysync"},
 			"CHAT_PRESENCE": {"chatpresence", "archive"},
 			"CALL":          {"calloffer", "callaccept", "callterminate", "calloffernotice", "callrelaylatency"},
-			"CONNECTION":    {"connected", "pairsuccess", "temporaryban", "loggedout", "connectfailure", "disconnected"},
+			"CONNECTION":    {"connected", "pairsuccess", "temporaryban", "loggedout", "connectfailure", "disconnected", "streamreplaced"},
 			"LABEL":         {"labeledit", "labelassociationchat", "labelassociationmessage"},
 			"CONTACT":       {"contact", "pushname"},
 			"GROUP":         {"groupinfo", "joinedgroup"},

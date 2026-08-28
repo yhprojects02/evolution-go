@@ -28,6 +28,7 @@ func TestRecoverableDisconnectReasonsAreRetried(t *testing.T) {
 		"Disconnected emitted because the websocket is closed by the server.",
 		"503",
 		"stream error",
+		disconnectReasonStreamReplaced,
 	}
 	for _, reason := range recoverable {
 		if isTerminalDisconnectReason(reason) {

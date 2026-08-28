@@ -14,6 +14,10 @@ import (
 // again from the console.
 const disconnectReasonRelinkRequired = "relink required: WhatsApp removed this companion device"
 
+// disconnectReasonStreamReplaced records why a second client took over the
+// same WhatsApp device credentials.
+const disconnectReasonStreamReplaced = "StreamReplaced: another client connected using the same device credentials"
+
 // SupervisorInterval is how often every registered instance is checked against
 // its live client.
 const SupervisorInterval = 60 * time.Second

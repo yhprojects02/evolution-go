@@ -367,8 +367,23 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError(
 				"[%s] Device credentials for %s are gone — WhatsApp unlinked this companion. Not re-pairing on a reconnect; the number must be linked again.",
 				cd.Instance.Id, cd.Instance.Jid)
-			if err := w.instanceRepository.UpdateConnected(cd.Instance.Id, false, disconnectReasonRelinkRequired); err != nil {
+			updater, ok := w.instanceRepository.(instance_repository.ConditionalConnectedUpdater)
+			if !ok {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Instance repository does not support conditional relink updates", cd.Instance.Id)
+			} else if err := updater.UpdateConnectedIfReasonEmptyOrGeneric(cd.Instance.Id, disconnectReasonRelinkRequired); err != nil {
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
+			}
+			if err := appendDisconnectEvent(
+				w.instanceRepository,
+				cd.Instance,
+				nil,
+				"RelinkRequired",
+				disconnectReasonRelinkRequired,
+				false,
+				false,
+				nil,
+			); err != nil {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to record relink-required event: %v", cd.Instance.Id, err)
 			}
 			return
 		}
@@ -941,6 +956,67 @@ func processPresenceUpdates(mycli *MyClient) {
 	}
 }
 
+func disconnectEventJID(instance *instance_model.Instance, client *whatsmeow.Client) string {
+	if instance != nil && strings.TrimSpace(instance.Jid) != "" {
+		return instance.Jid
+	}
+	if client != nil && client.Store != nil && client.Store.ID != nil {
+		return client.Store.ID.String()
+	}
+	return ""
+}
+
+// appendDisconnectEvent is deliberately best-effort. A diagnostic database
+// failure must not turn a whatsmeow event into a failed event-handler path.
+// The optional interface also keeps existing InstanceRepository consumers and
+// test doubles compatible while the concrete repository gains this capability.
+func appendDisconnectEvent(
+	repository instance_repository.InstanceRepository,
+	instance *instance_model.Instance,
+	client *whatsmeow.Client,
+	eventName string,
+	reason string,
+	connectedAtEvent bool,
+	onConnect bool,
+	expiresAt *time.Time,
+) error {
+	if instance == nil {
+		return errors.New("cannot record disconnect event without an instance")
+	}
+
+	appender, ok := repository.(instance_repository.DisconnectEventAppender)
+	if !ok {
+		return errors.New("instance repository does not support disconnect events")
+	}
+
+	return appender.AppendDisconnectEvent(instance_repository.InstanceDisconnectEvent{
+		InstanceID:       instance.Id,
+		ClientName:       instance.ClientName,
+		Jid:              disconnectEventJID(instance, client),
+		EventName:        eventName,
+		Reason:           reason,
+		ConnectedAtEvent: connectedAtEvent,
+		OnConnect:        onConnect,
+		ExpiresAt:        expiresAt,
+		Timestamp:        time.Now().UTC(),
+	})
+}
+
+func (mycli *MyClient) recordDisconnectEvent(eventName, reason string, connectedAtEvent, onConnect bool, expiresAt *time.Time) {
+	if err := appendDisconnectEvent(
+		mycli.instanceRepository,
+		mycli.Instance,
+		mycli.WAClient,
+		eventName,
+		reason,
+		connectedAtEvent,
+		onConnect,
+		expiresAt,
+	); err != nil {
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to record disconnect event %s: %v", mycli.userID, eventName, err)
+	}
+}
+
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	// whatsmeow calls event handlers on its own goroutine, so a panic in here
 	// is a process-wide outage, not a one-message failure. Contain it to the
@@ -1099,12 +1175,45 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		postMap["data"] = dataMap
 	case *events.StreamReplaced:
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Received StreamReplaced event", mycli.userID)
-		return
+		reason := disconnectReasonStreamReplaced
+		connectedAtEvent := mycli.Instance.Connected
+		jid := disconnectEventJID(mycli.Instance, mycli.WAClient)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn(
+			"[%s] Received StreamReplaced event for jid %s: %s",
+			mycli.userID,
+			jid,
+			reason,
+		)
+		mycli.recordDisconnectEvent("StreamReplaced", reason, connectedAtEvent, false, nil)
+
+		mycli.Instance.Connected = false
+		mycli.Instance.DisconnectReason = reason
+		if err := mycli.instanceRepository.UpdateConnected(mycli.Instance.Id, false, reason); err != nil {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance after StreamReplaced: %s", mycli.userID, err)
+		}
+
+		doWebhook = true
+		postMap["event"] = "StreamReplaced"
+		postMap["data"] = map[string]interface{}{
+			"reason": reason,
+			"jid":    jid,
+		}
 	case *events.TemporaryBan:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] User received temporary ban for %s", mycli.userID, evt.Code.String())
 		doWebhook = true
 		postMap["event"] = "TemporaryBan"
+		var expiresAt *time.Time
+		if evt.Expire > 0 {
+			expires := time.Now().UTC().Add(evt.Expire)
+			expiresAt = &expires
+		}
+		mycli.recordDisconnectEvent(
+			"TemporaryBan",
+			evt.Code.String(),
+			mycli.Instance.Connected,
+			false,
+			expiresAt,
+		)
 
 		if postMap["data"] != nil {
 			jsonBytes, err := json.Marshal(postMap["data"])
@@ -1977,6 +2086,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "LoggedOut"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Logged out for reason %s", mycli.userID, evt.Reason.String())
+		mycli.recordDisconnectEvent("LoggedOut", evt.Reason.String(), evt.OnConnect, evt.OnConnect, nil)
 
 		// Limpar cache de userInfo para esta instância
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
@@ -2096,6 +2206,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "ConnectFailure"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Connection failed with reason %s", mycli.userID, evt.Reason.String())
+		mycli.recordDisconnectEvent("ConnectFailure", evt.Reason.String(), mycli.Instance.Connected, false, nil)
 
 		// Limpar cache de userInfo para esta instância
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
@@ -2110,12 +2221,14 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.Disconnected:
 		doWebhook = true
 		postMap["event"] = "Disconnected"
+		reason := "Disconnected emitted because the websocket is closed by the server."
+		mycli.recordDisconnectEvent("Disconnected", reason, mycli.Instance.Connected, false, nil)
 
 		// Limpar cache de userInfo para esta instância (mas não para reconexão automática)
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, mycli.Instance.Token)
 
-		mycli.Instance.DisconnectReason = "Disconnected emitted because the websocket is closed by the server."
+		mycli.Instance.DisconnectReason = reason
 		mycli.Instance.Connected = false
 		err := mycli.instanceRepository.UpdateConnected(mycli.Instance.Id, mycli.Instance.Connected, mycli.Instance.DisconnectReason)
 		if err != nil {
@@ -2358,7 +2471,7 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
-	case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+	case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced":
 		if contains(subscriptions, "CONNECTION") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
@@ -2651,7 +2764,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 				globalEventType = "CHAT_PRESENCE"
 			case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 				globalEventType = "CALL"
-			case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+			case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced":
 				globalEventType = "CONNECTION"
 			case "LabelEdit", "LabelAssociationChat", "LabelAssociationMessage":
 				globalEventType = "LABEL"
@@ -2709,7 +2822,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 			globalEventType = "CHAT_PRESENCE"
 		case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 			globalEventType = "CALL"
-		case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected":
+		case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced":
 			globalEventType = "CONNECTION"
 		case "LabelEdit", "LabelAssociationChat", "LabelAssociationMessage":
 			globalEventType = "LABEL"

@@ -37,6 +37,21 @@ type InstanceRepository interface {
 	UpdateAdvancedSettings(instanceId string, settings *instance_model.AdvancedSettings) error
 }
 
+// ConditionalConnectedUpdater is implemented by repositories that can
+// preserve a specific disconnect reason with one SQL UPDATE predicate.
+// Keeping it separate from InstanceRepository avoids breaking existing test
+// doubles and integrations that only need the original instance operations.
+type ConditionalConnectedUpdater interface {
+	UpdateConnectedIfReasonEmptyOrGeneric(userId string, genericReason string) error
+}
+
+// DisconnectEventAppender persists append-only disconnect diagnostics.
+// Event callers deliberately type-assert this optional capability so a
+// persistence failure can be logged and swallowed without stopping WhatsApp.
+type DisconnectEventAppender interface {
+	AppendDisconnectEvent(event InstanceDisconnectEvent) error
+}
+
 type instanceRepository struct {
 	db          *gorm.DB
 	labelRepo   label_repository.LabelRepository
@@ -124,6 +139,54 @@ func (i *instanceRepository) UpdateConnected(userId string, status bool, disconn
 		updates["disconnected_at"] = gorm.Expr("COALESCE(disconnected_at, ?)", time.Now().UTC())
 	}
 	return i.db.Model(&instance_model.Instance{}).Where("id = ?", userId).Updates(updates).Error
+}
+
+// UpdateConnectedIfReasonEmptyOrGeneric records the relink-required state
+// without replacing a more specific reason that may have arrived concurrently.
+// The predicate and update are one SQL statement, so this is deliberately not
+// implemented as a read followed by UpdateConnected.
+func (i *instanceRepository) UpdateConnectedIfReasonEmptyOrGeneric(userId string, genericReason string) error {
+	updates := map[string]interface{}{
+		"connected": false,
+		"disconnect_reason": gorm.Expr(
+			"CASE WHEN disconnect_reason IS NULL OR disconnect_reason = '' OR disconnect_reason = ? THEN ? ELSE disconnect_reason END",
+			genericReason,
+			genericReason,
+		),
+		"disconnected_at": gorm.Expr("COALESCE(disconnected_at, ?)", time.Now().UTC()),
+	}
+
+	return i.db.Model(&instance_model.Instance{}).
+		Where("id = ?", userId).
+		Updates(updates).Error
+}
+
+// AppendDisconnectEvent stores one event and trims older rows for that
+// instance in the same transaction. The returned error is intentionally left
+// to the event caller to log and swallow so diagnostics can never interrupt a
+// whatsmeow event handler.
+func (i *instanceRepository) AppendDisconnectEvent(event InstanceDisconnectEvent) error {
+	if event.InstanceID == "" {
+		return fmt.Errorf("instance repository: disconnect event instance id is empty")
+	}
+	if event.EventName == "" {
+		return fmt.Errorf("instance repository: disconnect event name is empty")
+	}
+
+	return i.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&event).Error; err != nil {
+			return err
+		}
+
+		recentEvents := tx.Model(&InstanceDisconnectEvent{}).
+			Select("id").
+			Where("instance_id = ?", event.InstanceID).
+			Order("timestamp DESC, id DESC").
+			Limit(maxDisconnectEventsPerInstance)
+
+		return tx.Where("instance_id = ? AND id NOT IN (?)", event.InstanceID, recentEvents).
+			Delete(&InstanceDisconnectEvent{}).Error
+	})
 }
 
 func (i *instanceRepository) InitializeDisconnectedTracking(now time.Time, clientName string) (int64, error) {

@@ -1,6 +1,7 @@
 package instance_repository
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -173,7 +174,37 @@ func (i *instanceRepository) AppendDisconnectEvent(event InstanceDisconnectEvent
 		return fmt.Errorf("instance repository: disconnect event name is empty")
 	}
 
+	if event.RepeatCount < 1 {
+		event.RepeatCount = 1
+	}
+
 	return i.db.Transaction(func(tx *gorm.DB) error {
+		// A retry loop re-emits the same event forever. Inserting every
+		// repetition pushes the rows that actually explain the incident past
+		// the retention cap, so fold a consecutive duplicate into the row it
+		// repeats instead of appending a new one.
+		var latest InstanceDisconnectEvent
+		err := tx.Where("instance_id = ?", event.InstanceID).
+			Order("timestamp DESC, id DESC").
+			First(&latest).Error
+		switch {
+		case err == nil:
+			if latest.EventName == event.EventName &&
+				latest.Reason == event.Reason &&
+				latest.Jid == event.Jid {
+				return tx.Model(&InstanceDisconnectEvent{}).
+					Where("id = ?", latest.Id).
+					Updates(map[string]interface{}{
+						"timestamp":    event.Timestamp,
+						"repeat_count": gorm.Expr("repeat_count + ?", event.RepeatCount),
+					}).Error
+			}
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			// First event for this instance; fall through to the insert.
+		default:
+			return err
+		}
+
 		if err := tx.Create(&event).Error; err != nil {
 			return err
 		}

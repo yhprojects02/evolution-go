@@ -49,6 +49,11 @@ type InstanceDisconnectEvent struct {
 	ConnectedAtEvent bool       `json:"connected_at_event"`
 	OnConnect        bool       `json:"on_connect"`
 	ExpiresAt        *time.Time `json:"expires_at,omitempty" gorm:"index"`
+	// RepeatCount collapses an identical event repeating back-to-back (a retry
+	// loop) into one row. Without it a loop firing every few minutes evicts the
+	// distinct rows that explain the incident, which is exactly the history an
+	// investigation needs.
+	RepeatCount      int        `json:"repeat_count" gorm:"not null;default:1"`
 	Timestamp        time.Time  `json:"timestamp" gorm:"column:timestamp;autoCreateTime;not null;index:idx_instance_disconnect_events_instance_timestamp,priority:2"`
 }
 

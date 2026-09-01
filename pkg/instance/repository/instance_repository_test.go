@@ -2,6 +2,7 @@ package instance_repository
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -45,6 +46,7 @@ func newInstanceRepositoryTestDB(t *testing.T) (*gorm.DB, *sql.DB) {
 			connected_at_event BOOLEAN NOT NULL DEFAULT FALSE,
 			on_connect BOOLEAN NOT NULL DEFAULT FALSE,
 			expires_at TIMESTAMP,
+			repeat_count INTEGER NOT NULL DEFAULT 1,
 			timestamp TIMESTAMP NOT NULL
 		)`,
 	}
@@ -169,14 +171,17 @@ func TestAppendDisconnectEventCapsRowsPerInstance(t *testing.T) {
 	}
 
 	const instanceID = "instance-flapping"
+	base := time.Now().UTC()
 	for n := 0; n < maxDisconnectEventsPerInstance+5; n++ {
+		// Distinct reasons: consecutive duplicates are collapsed by design, so
+		// only distinct events can exercise the retention cap.
 		if err := appender.AppendDisconnectEvent(InstanceDisconnectEvent{
 			InstanceID:       instanceID,
 			ClientName:       "test-client",
 			EventName:        "Disconnected",
-			Reason:           "test reason",
+			Reason:           fmt.Sprintf("test reason %d", n),
 			ConnectedAtEvent: false,
-			Timestamp:        time.Now().UTC(),
+			Timestamp:        base.Add(time.Duration(n) * time.Second),
 		}); err != nil {
 			t.Fatalf("AppendDisconnectEvent(%d) error = %v", n, err)
 		}
@@ -192,3 +197,79 @@ func TestAppendDisconnectEventCapsRowsPerInstance(t *testing.T) {
 }
 
 const disconnectReasonForTest = "relink required: test generic reason"
+
+func TestAppendDisconnectEventCollapsesConsecutiveDuplicates(t *testing.T) {
+	db, sqlDB := newInstanceRepositoryTestDB(t)
+	repository := NewInstanceRepository(db)
+	appender := repository.(DisconnectEventAppender)
+
+	const instanceID = "instance-retry-loop"
+	base := time.Now().UTC()
+	for n := 0; n < 5; n++ {
+		if err := appender.AppendDisconnectEvent(InstanceDisconnectEvent{
+			InstanceID: instanceID,
+			EventName:  "RelinkRequired",
+			Reason:     disconnectReasonForTest,
+			Jid:        "60183214788:5@s.whatsapp.net",
+			Timestamp:  base.Add(time.Duration(n) * time.Minute),
+		}); err != nil {
+			t.Fatalf("AppendDisconnectEvent(%d) error = %v", n, err)
+		}
+	}
+
+	var count, repeats int
+	if err := sqlDB.QueryRow(
+		`SELECT COUNT(*), COALESCE(MAX(repeat_count), 0) FROM instance_disconnect_events WHERE instance_id = ?`,
+		instanceID,
+	).Scan(&count, &repeats); err != nil {
+		t.Fatalf("count events error = %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("event count = %d, want 1", count)
+	}
+	if repeats != 5 {
+		t.Fatalf("repeat_count = %d, want 5", repeats)
+	}
+}
+
+func TestAppendDisconnectEventKeepsLogoutReasonUnderRetryFlood(t *testing.T) {
+	db, sqlDB := newInstanceRepositoryTestDB(t)
+	repository := NewInstanceRepository(db)
+	appender := repository.(DisconnectEventAppender)
+
+	const instanceID = "instance-unlinked"
+	const logoutReason = "401: logged out from another device"
+	base := time.Now().UTC()
+
+	if err := appender.AppendDisconnectEvent(InstanceDisconnectEvent{
+		InstanceID: instanceID,
+		EventName:  "LoggedOut",
+		Reason:     logoutReason,
+		Timestamp:  base,
+	}); err != nil {
+		t.Fatalf("AppendDisconnectEvent(LoggedOut) error = %v", err)
+	}
+
+	// The supervisor used to re-emit this every few minutes for days.
+	for n := 0; n < maxDisconnectEventsPerInstance*3; n++ {
+		if err := appender.AppendDisconnectEvent(InstanceDisconnectEvent{
+			InstanceID: instanceID,
+			EventName:  "RelinkRequired",
+			Reason:     disconnectReasonForTest,
+			Timestamp:  base.Add(time.Duration(n+1) * time.Minute),
+		}); err != nil {
+			t.Fatalf("AppendDisconnectEvent(RelinkRequired %d) error = %v", n, err)
+		}
+	}
+
+	var kept int
+	if err := sqlDB.QueryRow(
+		`SELECT COUNT(*) FROM instance_disconnect_events WHERE instance_id = ? AND reason = ?`,
+		instanceID, logoutReason,
+	).Scan(&kept); err != nil {
+		t.Fatalf("count logout events error = %v", err)
+	}
+	if kept != 1 {
+		t.Fatalf("logout rows = %d, want 1 (the real reason was evicted by the retry loop)", kept)
+	}
+}

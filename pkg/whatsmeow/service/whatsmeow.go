@@ -239,9 +239,27 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 		return fmt.Errorf("failed to get instance: %v", err)
 	}
 
+	// A revoked companion never comes back from a reconnect. Restarting it
+	// churns the phone's device slots and, worse, the generic "Reconnecting"
+	// reason below would hide the real cause (e.g. "401: logged out from
+	// another device") from the supervisor's terminal-reason check, turning a
+	// dead instance into a retry loop that runs until someone notices.
+	if isTerminalDisconnectReason(instance.DisconnectReason) {
+		w.loggerWrapper.GetLogger(instanceId).LogWarn(
+			"[%s] Not reconnecting: disconnect reason %q is terminal, the number must be linked again",
+			instanceId, instance.DisconnectReason)
+		return fmt.Errorf("instance %s cannot reconnect: %s", instanceId, instance.DisconnectReason)
+	}
+
 	instance.Connected = false
 	instance.DisconnectReason = "Reconnecting"
-	err = w.instanceRepository.UpdateConnected(instanceId, false, "Reconnecting")
+	// Never overwrite a specific reason with the generic marker; a LoggedOut
+	// handler may have written the real one microseconds earlier.
+	if updater, ok := w.instanceRepository.(instance_repository.ConditionalConnectedUpdater); ok {
+		err = updater.UpdateConnectedIfReasonEmptyOrGeneric(instanceId, "Reconnecting")
+	} else {
+		err = w.instanceRepository.UpdateConnected(instanceId, false, "Reconnecting")
+	}
 	if err != nil {
 		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Failed to update disconnect status: %v", instanceId, err)
 	}

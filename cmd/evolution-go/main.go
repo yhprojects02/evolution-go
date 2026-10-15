@@ -189,7 +189,7 @@ func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql
 		loggerWrapper,
 	)
 	callRuntime.SetPublisher(func(instance *instance_model.Instance, event call_service.CallEnvelope) {
-		payload, marshalErr := json.Marshal(map[string]any{"event": "CallState", "instance": instance.Id, "data": event})
+		payload, marshalErr := json.Marshal(buildCallStateWebhookPayload(instance, event))
 		if marshalErr != nil {
 			return
 		}
@@ -286,6 +286,20 @@ func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql
 	})
 
 	return r, callRuntime
+}
+
+func buildCallStateWebhookPayload(instance *instance_model.Instance, event call_service.CallEnvelope) map[string]any {
+	// This backend-to-backend metadata authenticates the webhook sender. Keep
+	// it outside the call envelope and defensively strip controller capability.
+	event.ControllerID = ""
+	return map[string]any{
+		"event":         "CallState",
+		"instance":      instance.Id,
+		"instanceToken": instance.Token,
+		"instanceId":    instance.Id,
+		"instanceName":  instance.Name,
+		"data":          event,
+	}
 }
 
 func turnICEURLs(host string) string {

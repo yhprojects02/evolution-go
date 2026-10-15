@@ -35,6 +35,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	call_service "github.com/EvolutionAPI/evolution-go/pkg/call/service"
 	"github.com/EvolutionAPI/evolution-go/pkg/config"
 	producer_interfaces "github.com/EvolutionAPI/evolution-go/pkg/events/interfaces"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
@@ -88,6 +89,7 @@ type whatsmeowService struct {
 	killChannel        *registry.KillChannels
 	userInfoCache      *cache.Cache
 	clientPointer      *registry.Clients
+	callRuntime        *call_service.Runtime
 	myClientPointer    *myClients
 	reviveLimiter      *reviveLimiter
 	rabbitmqProducer   producer_interfaces.Producer
@@ -103,6 +105,7 @@ type whatsmeowService struct {
 
 type MyClient struct {
 	service            WhatsmeowService
+	callRuntime        *call_service.Runtime
 	WAClient           *whatsmeow.Client
 	eventHandlerID     uint32
 	userID             string
@@ -541,6 +544,12 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	}
 	clientLog := waLog.Stdout("Client", minLevel, true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
+	if w.callRuntime != nil {
+		if err := w.callRuntime.RegisterInstance(cd.Instance, client); err != nil {
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Call runtime initialization failed: %v", cd.Instance.Id, err)
+			return
+		}
+	}
 
 	w.clientPointer.Set(cd.Instance.Id, client)
 	if cd.IsProxy {
@@ -603,6 +612,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	mycli := &MyClient{
 		service:            &w,
+		callRuntime:        w.callRuntime,
 		Instance:           cd.Instance,
 		WAClient:           client,
 		eventHandlerID:     1,
@@ -1176,6 +1186,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 	case *events.Connected, *events.PushNameSetting:
+		if mycli.callRuntime != nil {
+			mycli.callRuntime.RefreshInstancePhone(mycli.Instance.Id)
+		}
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] events.Connected to Whatsapp for user '%s'", mycli.userID, mycli.WAClient.Store.PushName)
 		doWebhook = true
 		postMap["event"] = "Connected"
@@ -1238,6 +1251,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
 	case *events.PairSuccess:
+		if mycli.callRuntime != nil {
+			mycli.callRuntime.RefreshInstancePhone(mycli.Instance.Id)
+		}
 		doWebhook = true
 		postMap["event"] = "PairSuccess"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("QR Pair Success for user '%s' with JID '%s' - '%s'", mycli.userID, evt.ID.String(), mycli.WAClient.Store.ID.String())
@@ -2297,7 +2313,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Auto-rejecting call from %s", mycli.userID, evt.CallCreator.String())
 
 			// Rejeita a chamada
-			mycli.WAClient.RejectCall(context.Background(), evt.CallCreator, evt.CallID)
+			managedReject := mycli.callRuntime != nil && mycli.callRuntime.RejectWhatsAppCall(mycli.Instance.Id, evt.CallID)
+			if !managedReject {
+				mycli.WAClient.RejectCall(context.Background(), evt.CallCreator, evt.CallID)
+			}
 
 			// Envia mensagem de rejeição se configurada
 			if mycli.Instance.MsgRejectCall != "" {
@@ -2338,6 +2357,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "OfflineSyncCompleted"
 	case *events.ConnectFailure:
+		if mycli.callRuntime != nil {
+			mycli.callRuntime.EndCalls(mycli.Instance.Id, "whatsapp_connect_failure")
+		}
 		doWebhook = true
 		postMap["event"] = "ConnectFailure"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Connection failed with reason %s", mycli.userID, evt.Reason.String())
@@ -2354,6 +2376,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
 	case *events.Disconnected:
+		if mycli.callRuntime != nil {
+			mycli.callRuntime.EndCalls(mycli.Instance.Id, "whatsapp_disconnected")
+		}
 		doWebhook = true
 		postMap["event"] = "Disconnected"
 		reason := "Disconnected emitted because the websocket is closed by the server."
@@ -2604,6 +2629,10 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 	case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 		if contains(subscriptions, "CALL") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
+			w.sendToQueueOrWebhook(instance, queueName, jsonData)
+		}
+	case "CallState":
+		if contains(subscriptions, "CALL") {
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
 	case "Connected", "PairSuccess", "TemporaryBan", "LoggedOut", "ConnectFailure", "Disconnected", "StreamReplaced":
@@ -3176,6 +3205,7 @@ func NewWhatsmeowService(
 	config *config.Config,
 	killChannel *registry.KillChannels,
 	clientPointer *registry.Clients,
+	callRuntime *call_service.Runtime,
 	rabbitmqProducer producer_interfaces.Producer,
 	webhookProducer producer_interfaces.Producer,
 	websocketProducer producer_interfaces.Producer,
@@ -3202,6 +3232,7 @@ func NewWhatsmeowService(
 		killChannel:        killChannel,
 		userInfoCache:      cache.New(5*time.Minute, 10*time.Minute),
 		clientPointer:      clientPointer,
+		callRuntime:        callRuntime,
 		myClientPointer:    newMyClients(),
 		reviveLimiter:      newReviveLimiter(),
 		rabbitmqProducer:   rabbitmqProducer,
@@ -3219,6 +3250,17 @@ func NewWhatsmeowService(
 // GetPollService retorna o serviço de polls (evita dupla inicialização)
 func (w *whatsmeowService) GetPollService() poll_service.PollService {
 	return w.pollService
+}
+
+func (w *whatsmeowService) CleanupCalls(instanceID, reason string, remove bool) {
+	if w.callRuntime == nil {
+		return
+	}
+	if remove {
+		w.callRuntime.CleanupInstance(instanceID, reason)
+	} else {
+		w.callRuntime.EndCalls(instanceID, reason)
+	}
 }
 
 // cleanSenderID remove a parte ":numero" do sender ID para exibir apenas o remoteJid correto

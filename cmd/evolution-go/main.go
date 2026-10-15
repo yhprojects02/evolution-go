@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -82,7 +83,7 @@ func init() {
 	}
 }
 
-func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.Config, conn *amqp.Connection, exPath string, runtimeCtx *core.RuntimeContext) *gin.Engine {
+func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.Config, conn *amqp.Connection, exPath string, runtimeCtx *core.RuntimeContext) (*gin.Engine, *call_service.Runtime) {
 	killChannel := registry.NewKillChannels()
 	clientPointer := registry.NewClients()
 
@@ -162,6 +163,13 @@ func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql
 	messageRepository := message_repository.NewMessageRepository(db)
 	labelRepository := label_repository.NewLabelRepository(db)
 
+	callRuntime := call_service.NewRuntime(call_service.RuntimeOptions{
+		Enabled: config.CallsEnabled, Allowlist: config.CallsInstanceAllowlist,
+		MaxActive: config.CallsMaxActive, UDPBind: config.CallsMediaUDPBind,
+		UDPPort: config.CallsMediaUDPPort, PublicIP: config.CallsPublicIP,
+		TURNURL: turnICEURLs(config.CallsTurnURL), TURNSecret: config.CallsTurnSecret,
+		TURNTTL: time.Duration(config.CallsTurnTTLSeconds) * time.Second,
+	})
 	whatsmeowService := whatsmeow_service.NewWhatsmeowService(
 		instanceRepository,
 		authDB,
@@ -170,6 +178,7 @@ func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql
 		config,
 		killChannel,
 		clientPointer,
+		callRuntime,
 		rabbitmqProducer,
 		webhookProducer,
 		websocketProducer,
@@ -179,6 +188,13 @@ func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql
 		natsProducer,
 		loggerWrapper,
 	)
+	callRuntime.SetPublisher(func(instance *instance_model.Instance, event call_service.CallEnvelope) {
+		payload, marshalErr := json.Marshal(map[string]any{"event": "CallState", "instance": instance.Id, "data": event})
+		if marshalErr != nil {
+			return
+		}
+		whatsmeowService.CallWebhook(instance, instance.Id+".CallState", payload)
+	})
 	instanceService := instance_service.NewInstanceService(
 		instanceRepository,
 		killChannel,
@@ -192,7 +208,7 @@ func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql
 	messageService := message_service.NewMessageService(clientPointer, messageRepository, whatsmeowService, loggerWrapper)
 	chatService := chat_service.NewChatService(clientPointer, whatsmeowService, loggerWrapper)
 	groupService := group_service.NewGroupService(clientPointer, whatsmeowService, loggerWrapper)
-	callService := call_service.NewCallService(clientPointer, whatsmeowService, loggerWrapper)
+	callService := call_service.NewCallService(clientPointer, callRuntime, loggerWrapper, whatsmeowService.StartInstance)
 	communityService := community_service.NewCommunityService(clientPointer, whatsmeowService, loggerWrapper)
 	labelService := label_service.NewLabelService(clientPointer, whatsmeowService, labelRepository, loggerWrapper)
 	newsletterService := newsletter_service.NewNewsletterService(clientPointer, whatsmeowService, loggerWrapper)
@@ -269,7 +285,15 @@ func setupRouter(ctx context.Context, db *gorm.DB, authDB *sql.DB, sqliteDB *sql
 		websocket_producer.ServeWs(c.Writer, c.Request, instanceId, websocketProducer)
 	})
 
-	return r
+	return r, callRuntime
+}
+
+func turnICEURLs(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" || strings.HasPrefix(host, "turn:") || strings.HasPrefix(host, "turns:") {
+		return host
+	}
+	return strings.Join([]string{"turn:" + host + ":3478?transport=udp", "turn:" + host + ":3478?transport=tcp", "turns:" + host + ":443?transport=tcp"}, ",")
 }
 
 func migrate(db *gorm.DB) {
@@ -425,8 +449,10 @@ func main() {
 	// The heartbeat and background maintenance workers share the same lifecycle.
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
-
-	r := setupRouter(appCtx, db, authDB, sqliteDB, cfg, conn, exPath, runtimeCtx)
+	r, callRuntime := setupRouter(appCtx, db, authDB, sqliteDB, cfg, conn, exPath, runtimeCtx)
+	defer callRuntime.Close()
+	stopCallMaintenance := callRuntime.StartMaintenance(appCtx)
+	defer stopCallMaintenance()
 
 	core.StartHeartbeat(appCtx, runtimeCtx, startTime)
 

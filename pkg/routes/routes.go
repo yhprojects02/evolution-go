@@ -194,9 +194,20 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 	{
 		routes.Use(r.authMiddleware.Auth)
 		{
-			routes.POST("/reject", r.jidValidationMiddleware.ValidateNumberField(), r.callHandler.RejectCall)
+			routes.POST("/dial", r.callHandler.Dial)
+			routes.POST("/answer", r.callHandler.Answer)
+			routes.POST("/reject", r.callHandler.RejectCall)
+			routes.POST("/hangup", r.callHandler.Hangup)
+			routes.GET("/current", r.callHandler.Current)
+			routes.POST("/signal/offer", r.callHandler.Offer)
+			routes.POST("/signal/candidate", r.callHandler.Candidate)
+			routes.POST("/heartbeat", r.callHandler.Heartbeat)
+			routes.GET("/ice-config", r.callHandler.ICEConfig)
 		}
 	}
+	deployCalls := eng.Group("/call")
+	deployCalls.Use(r.authMiddleware.AuthAdmin)
+	deployCalls.POST("/deploy-drain", r.callHandler.DeploymentDrain)
 	routes = eng.Group("/community")
 	{
 		routes.Use(r.authMiddleware.Auth)

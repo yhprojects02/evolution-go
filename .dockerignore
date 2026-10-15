@@ -1,6 +1,8 @@
 # Git
 .git
 .gitignore
+.env*
+.dev.vars*
 
 # Documentation
 README.md

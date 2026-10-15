@@ -331,6 +331,9 @@ func (i instances) Disconnect(instance *instance_model.Instance) (*instance_mode
 
 	if client.IsConnected() {
 		if client.IsLoggedIn() {
+			if cleaner, ok := i.whatsmeowService.(interface{ CleanupCalls(string, string, bool) }); ok {
+				cleaner.CleanupCalls(instance.Id, "instance_disconnected", false)
+			}
 			i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Disconnection successful", instance.Id)
 			i.killChannel.Signal(instance.Id)
 
@@ -356,6 +359,9 @@ func (i instances) Logout(instance *instance_model.Instance) (*instance_model.In
 	}
 
 	if client.IsLoggedIn() && client.IsConnected() {
+		if cleaner, ok := i.whatsmeowService.(interface{ CleanupCalls(string, string, bool) }); ok {
+			cleaner.CleanupCalls(instance.Id, "instance_logout", false)
+		}
 		err := client.Logout(context.Background())
 		if err != nil {
 			return instance, err
@@ -667,6 +673,9 @@ func (i instances) Delete(id string) error {
 	instance, err := i.instanceRepository.GetInstanceByID(id)
 	if err != nil {
 		return err
+	}
+	if cleaner, ok := i.whatsmeowService.(interface{ CleanupCalls(string, string, bool) }); ok {
+		cleaner.CleanupCalls(instance.Id, "instance_deleted", true)
 	}
 
 	client := i.clientPointer.Get(instance.Id)

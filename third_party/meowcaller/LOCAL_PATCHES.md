@@ -9,13 +9,18 @@ revision `v0.0.0-20260726180203-6d9b7b2c1807` (commit
 These edits add codec selection dispatch, preserve direct-call MLow behavior
 while enabling negotiated Opus for one-to-one calls, close native codec
 resources, expose peer keyframe feedback, and optionally carry RTP timestamps
-and orientation to compatible sinks. `go.mod` changes only the whatsmeow
+and orientation to compatible sinks. `engine_media.go` also creates a distinct
+decoder for each MLow participant, preserving the upstream group receive
+behavior. `go.mod` changes only the whatsmeow
 replacement to this repository's retained fork. Added files are
 `LOCAL_PATCHES.md`, `audio_codec.go`, `audio_codec_cgo.go`,
 `audio_codec_nocgo.go`, `audio_codec_test.go`, and `audio_codec_nocgo_test.go`;
 `engine_hook_test.go` verifies the pinned raw adapter can install against the
-retained fork. Upstream docs, examples, datasheets, and repository metadata are
-omitted from this runtime copy.
+retained fork. The parent engine's browser media adapter separately handles
+bounded Opus RTP reordering and timestamp-aligned PLC, then aggregates
+variable-sized PCM callbacks into the 60 ms frames expected by meowcaller.
+Upstream docs, examples, and datasheets are omitted; selected source-package
+metadata files are retained in this copy.
 
 `engine_media.go` dispatches the selected one-to-one audio codec through the
 existing MLow implementation or a libopus encoder/decoder. Group media

@@ -36,3 +36,12 @@ The engine also samples numeric relay transport metadata while a call is
 active: SCTP smoothed RTT, DataChannel buffered bytes, and sent/received byte
 counters. The live-call hook is removed when the media channel closes; it does
 not expose relay addresses, identifiers, or packet contents.
+
+`engine.go` also recognizes a matching `CallAccept` from this account's stored
+phone or LID JID for an unclaimed incoming one-to-one call. It removes and
+finishes that companion mirror locally with `answered_elsewhere`; it does not
+send reject/terminate signaling, which would end the handset's accepted call.
+The call-map mutex makes this local acceptance mutually exclusive with a
+browser `Answer`. Explicit `Reject` and `Hangup` first atomically claim the
+registered call, so stale handles cannot signal after local cleanup. Regression
+coverage lives in `engine_lifecycle_test.go`.

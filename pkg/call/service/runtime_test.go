@@ -484,6 +484,44 @@ func TestPeerDisconnectGraceAndRingTimeout(t *testing.T) {
 	}
 }
 
+func TestAnsweredElsewhereReleasesReservationAndStaysTerminalPastRingTimeout(t *testing.T) {
+	runtime := NewRuntime(RuntimeOptions{HeartbeatTTL: time.Minute})
+	phone := "60183568788"
+	now := time.Now().UTC()
+	entry := &instanceCalls{accountPhone: phone, active: "answered-on-phone"}
+	live := &liveCall{
+		envelope: CallEnvelope{
+			CallID: "answered-on-phone", InstanceID: "instance", Direction: "inbound",
+			State: CallStateRinging, CreatedAt: now.Add(-61 * time.Second).UnixMilli(),
+		},
+		accountPhone: phone,
+	}
+	runtime.mu.Lock()
+	runtime.instances["instance"] = entry
+	runtime.calls[live.envelope.CallID] = live
+	runtime.phoneCalls[phone] = live.envelope.CallID
+	runtime.active = 1
+	runtime.mu.Unlock()
+
+	live.mu.Lock()
+	runtime.endLocked(live, "answered_elsewhere")
+	live.mu.Unlock()
+	runtime.release(live)
+	runtime.expireCalls(now.Add(61 * time.Second))
+
+	live.mu.Lock()
+	state, reason := live.envelope.State, live.envelope.EndReason
+	live.mu.Unlock()
+	if state != CallStateEnded || reason != "answered_elsewhere" {
+		t.Fatalf("post-timeout state/reason = %q/%q, want ended/answered_elsewhere", state, reason)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.phoneCalls[phone] != "" || entry.active != "" || runtime.active != 0 {
+		t.Fatalf("answered-elsewhere reservation leaked: phone=%q entry=%q active=%d", runtime.phoneCalls[phone], entry.active, runtime.active)
+	}
+}
+
 func TestPionUDPMuxLoopbackCarriesRTP(t *testing.T) {
 	probe, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {

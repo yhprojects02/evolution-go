@@ -76,7 +76,8 @@ type engineCall struct {
 	invitePeerDevice         groupCallDevice
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
-	acceptPending bool
+	acceptPending  bool
+	browserClaimed bool
 }
 
 func (e *engine) requestPeerVideoKeyframe(callID string) error {
@@ -697,7 +698,12 @@ func (e *engine) answer(c *Call) error {
 		return nil
 	}
 	e.mu.Lock()
+	if e.calls[c.id] != m || m.call != c {
+		e.mu.Unlock()
+		return fmt.Errorf("meowcaller: call %s ended before answer", c.id)
+	}
 	m.acceptPending = true
+	m.browserClaimed = true
 	e.mu.Unlock()
 
 	c.setPhase(CallPhaseConnecting)
@@ -734,14 +740,20 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 
 // reject declines an inbound call.
 func (e *engine) reject(c *Call) error {
-	m := e.lookup(c.id)
-	to, creator := c.peer, c.peer
-	if m != nil {
-		to, creator = m.from, m.creator
+	m := e.takeCall(c)
+	if m == nil {
+		return nil
+	}
+	to, creator := m.from, m.creator
+	if to.IsEmpty() {
+		to = c.peer
+	}
+	if creator.IsEmpty() {
+		creator = c.peer
 	}
 	rej := signaling.BuildReject(c.id, to, creator)
 	rej.Attrs["id"] = e.nextCallNodeID()
-	e.finishCall(c.id, "rejected")
+	e.finishCallState(c.id, m, "rejected")
 	if err := e.transmitCallNode(context.Background(), rej); err != nil {
 		return fmt.Errorf("send reject: %w", err)
 	}
@@ -750,14 +762,20 @@ func (e *engine) reject(c *Call) error {
 
 // hangup ends a call (either direction) and tears down its media.
 func (e *engine) hangup(c *Call) error {
-	m := e.lookup(c.id)
-	to, creator := c.peer, c.peer
-	if m != nil {
-		to, creator = m.from, m.creator
+	m := e.takeCall(c)
+	if m == nil {
+		return nil
+	}
+	to, creator := m.from, m.creator
+	if to.IsEmpty() {
+		to = c.peer
+	}
+	if creator.IsEmpty() {
+		creator = c.peer
 	}
 	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: c.id, To: to, CallCreator: creator})
 	term.Attrs["id"] = e.nextCallNodeID()
-	e.finishCall(c.id, "hangup")
+	e.finishCallState(c.id, m, "hangup")
 	if err := e.transmitCallNode(context.Background(), term); err != nil {
 		return fmt.Errorf("send terminate: %w", err)
 	}
@@ -872,6 +890,9 @@ func (e *engine) onPreAccept(ev *events.CallPreAccept) {
 // onAccept records that the peer answered an outgoing call. Media may already be running
 // from relay allocation, but inbound RTP is still what marks the call ready/active.
 func (e *engine) onAccept(ev *events.CallAccept) {
+	if e.finishIncomingAcceptedElsewhere(ev) {
+		return
+	}
 	m := e.lookup(ev.CallID)
 	if m == nil || m.direction != CallDirectionOutgoing {
 		return
@@ -933,6 +954,38 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 		"from": ev.From.String(), "platform": ev.RemotePlatform, "video": m.localVideo || m.remoteVideo,
 	})
 	e.maybeStartMedia(ev.CallID)
+}
+
+// finishIncomingAcceptedElsewhere clears this companion's unclaimed copy of an
+// incoming call when WhatsApp reports that one of this account's own devices
+// accepted it. Do this locally: sending reject/terminate would end the handset's
+// call on every other device too.
+func (e *engine) finishIncomingAcceptedElsewhere(ev *events.CallAccept) bool {
+	if ev == nil || ev.From.IsEmpty() || !e.isOwnCallJID(ev.From) {
+		return false
+	}
+	e.mu.Lock()
+	m := e.calls[ev.CallID]
+	if m == nil || m.direction != CallDirectionIncoming || m.group || m.acceptPending || m.browserClaimed || m.call == nil || m.call.State() != CallPhaseRinging {
+		e.mu.Unlock()
+		return false
+	}
+	// Removing the entry under the same mutex used by answer() makes local
+	// handset acceptance and a browser claim mutually exclusive.
+	delete(e.calls, ev.CallID)
+	e.mu.Unlock()
+	e.finishCallState(ev.CallID, m, "answered_elsewhere")
+	return true
+}
+
+func (e *engine) isOwnCallJID(candidate types.JID) bool {
+	if e == nil || e.c == nil || e.c.wa == nil || e.c.wa.Store == nil || candidate.IsEmpty() {
+		return false
+	}
+	candidate = candidate.ToNonAD()
+	ownPN := e.c.wa.Store.GetJID().ToNonAD()
+	ownLID := e.c.wa.Store.GetLID().ToNonAD()
+	return (!ownPN.IsEmpty() && candidate == ownPN) || (!ownLID.IsEmpty() && candidate == ownLID)
 }
 
 func inviteDeviceCapability(device types.JID, node *waBinary.Node) (groupCallDevice, bool) {
@@ -1259,20 +1312,48 @@ func (e *engine) finishCall(callID, reason string) {
 	if m != nil {
 		delete(e.calls, callID)
 	}
+	e.mu.Unlock()
+	e.finishCallState(callID, m, reason)
+}
+
+// takeCall atomically claims a live call for an explicit Reject/Hangup action.
+// A stale handle must not send signaling that could terminate a replacement or
+// accepted-elsewhere call with the same ID.
+func (e *engine) takeCall(call *Call) *engineCall {
+	if call == nil {
+		return nil
+	}
+	e.mu.Lock()
+	m := e.calls[call.id]
+	if m == nil || m.call != call {
+		e.mu.Unlock()
+		return nil
+	}
+	delete(e.calls, call.id)
+	e.mu.Unlock()
+	return m
+}
+
+// finishCallState releases an already-unregistered call without sending
+// signaling. This is also used for a verified local acceptance on another
+// device, where sending terminate would kill the accepted call.
+func (e *engine) finishCallState(callID string, m *engineCall, reason string) {
+	if m == nil {
+		return
+	}
+	e.mu.Lock()
 	var cancel, waitingRoomCancel context.CancelFunc
 	var call *Call
 	var receivers *participantReceiveRegistry
-	if m != nil {
-		cancel = m.cancel
-		m.cancel = nil
-		waitingRoomCancel = m.waitingRoomCancel
-		m.waitingRoomCancel = nil
-		clear(m.groupRawEpoch)
-		m.groupRawEpoch = nil
-		receivers = m.groupReceivers
-		m.groupReceivers = nil
-		call = m.call
-	}
+	cancel = m.cancel
+	m.cancel = nil
+	waitingRoomCancel = m.waitingRoomCancel
+	m.waitingRoomCancel = nil
+	clear(m.groupRawEpoch)
+	m.groupRawEpoch = nil
+	receivers = m.groupReceivers
+	m.groupReceivers = nil
+	call = m.call
 	e.mu.Unlock()
 	if cancel != nil {
 		cancel()

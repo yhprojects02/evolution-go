@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/purpshell/meowcaller/signaling"
+	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -51,6 +55,154 @@ func testEngineWithOutgoingCall() (*engine, *Call) {
 		remoteVideo: true,
 	}
 	return c.eng, call
+}
+
+func testEngineWithIncomingCall() (*engine, *Call, types.JID, types.JID) {
+	ownPN := types.NewJID("60183568788", types.DefaultUserServer)
+	ownLID := types.NewJID("self-lid", types.HiddenUserServer)
+	device := &store.Device{ID: &ownPN, LID: ownLID}
+	c := &Client{wa: whatsmeow.NewClient(device, nil)}
+	c.eng = newEngine(c)
+	call := &Call{eng: c.eng, id: "CID", peer: peerJID(), phase: CallPhaseRinging}
+	c.eng.calls["CID"] = &engineCall{call: call, direction: CallDirectionIncoming, from: peerJID(), creator: creatorJID()}
+	return c.eng, call, ownPN, ownLID
+}
+
+func TestOwnCallJIDMatchesStoredPhoneAndLIDWithoutDeviceSuffix(t *testing.T) {
+	eng, _, ownPN, ownLID := testEngineWithIncomingCall()
+	phoneDevice := ownPN
+	phoneDevice.Device = 4
+	lidDevice := ownLID
+	lidDevice.Device = 9
+	for name, candidate := range map[string]types.JID{"phone": phoneDevice, "lid": lidDevice} {
+		t.Run(name, func(t *testing.T) {
+			if !eng.isOwnCallJID(candidate) {
+				t.Fatalf("own %s JID with device suffix did not match", name)
+			}
+		})
+	}
+	if eng.isOwnCallJID(peerJID()) {
+		t.Fatal("foreign peer JID matched the local account")
+	}
+	if eng.isOwnCallJID(types.EmptyJID) {
+		t.Fatal("empty JID matched the local account")
+	}
+}
+
+func TestIncomingSelfAcceptFinishesLocallyAndMakesStaleControlsNoOps(t *testing.T) {
+	eng, call, _, ownLID := testEngineWithIncomingCall()
+	sent := 0
+	eng.sendCallNode = func(context.Context, waBinary.Node) error { sent++; return nil }
+	var endReason string
+	call.OnEnd(func(reason string) { endReason = reason })
+	acceptingDevice := ownLID
+	acceptingDevice.Device = 7
+	eng.onAccept(&events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: acceptingDevice}})
+
+	if call.State() != CallPhaseEnded || endReason != "answered_elsewhere" {
+		t.Fatalf("self accept ended (%v, %q), want Ended/answered_elsewhere", call.State(), endReason)
+	}
+	if eng.lookup(call.ID()) != nil {
+		t.Fatal("answered-elsewhere call remained registered")
+	}
+	if err := call.Hangup(); err != nil {
+		t.Fatalf("stale hangup: %v", err)
+	}
+	if err := call.Reject(); err != nil {
+		t.Fatalf("stale reject: %v", err)
+	}
+	if sent != 0 {
+		t.Fatalf("local sibling acceptance sent %d signaling nodes, want none", sent)
+	}
+}
+
+func TestIncomingForeignAcceptIsIgnoredAndBrowserAnswerWins(t *testing.T) {
+	t.Run("foreign acceptance", func(t *testing.T) {
+		eng, call, _, _ := testEngineWithIncomingCall()
+		eng.onAccept(&events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: peerJID()}})
+		if eng.lookup(call.ID()) == nil || call.State() != CallPhaseRinging {
+			t.Fatal("foreign accept ended the incoming call")
+		}
+	})
+	t.Run("browser claim", func(t *testing.T) {
+		for _, phase := range []CallPhase{CallPhaseConnecting, CallPhaseActive} {
+			t.Run(strconv.Itoa(int(phase)), func(t *testing.T) {
+				eng, call, _, ownLID := testEngineWithIncomingCall()
+				if err := call.Answer(); err != nil {
+					t.Fatalf("browser answer: %v", err)
+				}
+				m := eng.lookup(call.ID())
+				// Model the first mute_v2 arriving and the deferred <accept> being sent.
+				eng.mu.Lock()
+				m.acceptPending = false
+				eng.mu.Unlock()
+				call.setPhase(phase)
+				acceptingDevice := ownLID
+				acceptingDevice.Device = 7
+				eng.onAccept(&events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: acceptingDevice}})
+				if eng.lookup(call.ID()) != m || m.acceptPending || !m.browserClaimed || call.State() != phase {
+					t.Fatalf("sibling acceptance displaced browser-owned call after pending accept, phase=%v", phase)
+				}
+			})
+		}
+	})
+}
+
+func TestIncomingBrowserAnswerRacesSelfAcceptAtomically(t *testing.T) {
+	for attempt := 0; attempt < 100; attempt++ {
+		eng, call, _, ownLID := testEngineWithIncomingCall()
+		var endReason string
+		call.OnEnd(func(reason string) { endReason = reason })
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; _ = call.Answer() }()
+		go func() {
+			defer wg.Done()
+			<-start
+			eng.onAccept(&events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: ownLID}})
+		}()
+		close(start)
+		wg.Wait()
+		if m := eng.lookup(call.ID()); m != nil {
+			if !m.acceptPending || call.State() != CallPhaseConnecting {
+				t.Fatalf("attempt %d: retained call is not browser-claimed", attempt)
+			}
+		} else if call.State() != CallPhaseEnded || endReason != "answered_elsewhere" {
+			t.Fatalf("attempt %d: removed call ended as (%v, %q)", attempt, call.State(), endReason)
+		}
+	}
+}
+
+func TestConcurrentSelfAcceptAndTimeoutHangupSendAtMostOneTerminate(t *testing.T) {
+	for attempt := 0; attempt < 100; attempt++ {
+		eng, call, _, ownLID := testEngineWithIncomingCall()
+		var sent atomic.Int32
+		eng.sendCallNode = func(context.Context, waBinary.Node) error { sent.Add(1); return nil }
+		var endReason string
+		call.OnEnd(func(reason string) { endReason = reason })
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; _ = call.Hangup() }()
+		go func() {
+			defer wg.Done()
+			<-start
+			eng.onAccept(&events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: ownLID}})
+		}()
+		close(start)
+		wg.Wait()
+		count := sent.Load()
+		if endReason == "answered_elsewhere" && count != 0 {
+			t.Fatalf("attempt %d: answered-elsewhere cleanup sent %d nodes", attempt, count)
+		}
+		if endReason == "hangup" && count != 1 {
+			t.Fatalf("attempt %d: timeout hangup sent %d nodes, want one", attempt, count)
+		}
+		if endReason != "answered_elsewhere" && endReason != "hangup" {
+			t.Fatalf("attempt %d: unexpected end reason %q", attempt, endReason)
+		}
+	}
 }
 
 func videoStateNode(state int) *waBinary.Node {

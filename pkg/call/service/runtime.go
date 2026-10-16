@@ -139,11 +139,13 @@ type liveCall struct {
 	mediaAttached       bool
 	pcOfferPending      bool
 	audioCodec          callAudioEncoder
-	audioIn             chan []float32
+	audioIn             chan queuedAudioFrame
 	closeOnce           sync.Once
 	answerDone          chan struct{}
 	answerFn            func() error // set only by unit tests; production uses call.Answer
 	requestPeerKeyframe func() error
+	mediaDiagnostics    *callMediaDiagnostics
+	browserMediaStats   *BrowserMediaStats
 }
 
 func NewRuntime(options RuntimeOptions) *Runtime {
@@ -524,7 +526,8 @@ func (r *Runtime) addOutgoing(instanceID string, reservedEntry *instanceCalls, c
 	}
 	id := uuid.NewString()
 	now := time.Now().UTC()
-	live := &liveCall{envelope: CallEnvelope{CallID: id, InstanceID: instanceID, Peer: call.Peer().String(), Direction: "outbound", Media: media, State: CallStateDialing, Version: 1, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli()}, call: call, owner: owner, lastBeat: now, accountPhone: reservedEntry.accountPhone, audioIn: make(chan []float32, 12)}
+	mediaDiagnostics := newCallMediaDiagnostics()
+	live := &liveCall{envelope: CallEnvelope{CallID: id, InstanceID: instanceID, Peer: call.Peer().String(), Direction: "outbound", Media: media, State: CallStateDialing, Version: 1, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli()}, call: call, owner: owner, lastBeat: now, accountPhone: reservedEntry.accountPhone, audioIn: make(chan queuedAudioFrame, 12), mediaDiagnostics: mediaDiagnostics}
 	if peer != "" {
 		live.envelope.Peer = peer
 	}
@@ -575,7 +578,7 @@ func (r *Runtime) addIncoming(instanceID string, call *meowcaller.Call) {
 	if call.IsVideo() {
 		media = MediaVideo
 	}
-	live := &liveCall{envelope: CallEnvelope{CallID: newID, InstanceID: instanceID, Peer: call.Peer().String(), Direction: "inbound", Media: media, State: CallStateRinging, Version: 1, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli()}, call: call, accountPhone: entry.accountPhone, audioIn: make(chan []float32, 12)}
+	live := &liveCall{envelope: CallEnvelope{CallID: newID, InstanceID: instanceID, Peer: call.Peer().String(), Direction: "inbound", Media: media, State: CallStateRinging, Version: 1, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli()}, call: call, accountPhone: entry.accountPhone, audioIn: make(chan queuedAudioFrame, 12), mediaDiagnostics: newCallMediaDiagnostics()}
 	r.calls[newID] = live
 	entry.active = newID
 	r.phoneCalls[entry.accountPhone] = newID
@@ -758,6 +761,36 @@ func (r *Runtime) Snapshot(instanceID string) (CallEnvelope, bool) {
 		return CallEnvelope{}, false
 	}
 	return r.snapshotLocked(call, false), true
+}
+
+// CurrentMediaDiagnostics returns bounded, redacted diagnostics for an active
+// call belonging to this instance. It never returns call IDs, peer JIDs,
+// candidate addresses, credentials, SDP, or media content.
+func (r *Runtime) CurrentMediaDiagnostics(instanceID, expectedCallID string) (CallMediaDiagnostics, bool) {
+	r.mu.Lock()
+	entry := r.instances[instanceID]
+	if entry == nil || entry.active == "" || entry.active == "pending" || entry.active != expectedCallID {
+		r.mu.Unlock()
+		return CallMediaDiagnostics{}, false
+	}
+	call := r.calls[entry.active]
+	r.mu.Unlock()
+	if call == nil {
+		return CallMediaDiagnostics{}, false
+	}
+	call.mu.Lock()
+	pc := call.pc
+	whatsAppCall := call.call
+	diagnostics := call.mediaDiagnostics
+	browserStats := call.browserMediaStats
+	active := call.envelope.State == CallStateActive
+	call.mu.Unlock()
+	if !active || diagnostics == nil {
+		return CallMediaDiagnostics{}, false
+	}
+	result := diagnostics.snapshot(pc, whatsAppCall)
+	result.Browser = browserStats
+	return result, true
 }
 
 func (r *Runtime) claim(instanceID, callID, requestID string) (*liveCall, string, bool, error) {
@@ -958,13 +991,16 @@ func (r *Runtime) RejectWhatsAppCall(instanceID, whatsappCallID string) bool {
 	return true
 }
 
-func (r *Runtime) Heartbeat(instanceID, callID, owner string) error {
+func (r *Runtime) Heartbeat(instanceID, callID, owner string, browserStats *BrowserMediaStats) error {
 	call, err := r.lookupOwned(instanceID, callID, owner)
 	if err != nil {
 		return err
 	}
 	call.mu.Lock()
 	call.lastBeat = time.Now().UTC()
+	if sanitized := sanitizeBrowserMediaStats(browserStats); sanitized != nil {
+		call.browserMediaStats = sanitized
+	}
 	call.mu.Unlock()
 	return nil
 }
@@ -1033,6 +1069,7 @@ func (call *liveCall) closeMedia() {
 		call.mu.Lock()
 		pc := call.pc
 		call.pc = nil
+		call.browserMediaStats = nil
 		call.mu.Unlock()
 		if pc != nil {
 			_ = pc.Close()

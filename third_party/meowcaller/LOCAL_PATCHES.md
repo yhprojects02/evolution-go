@@ -31,3 +31,8 @@ source-compatible. The local engine adapter uses them to preserve WhatsApp
 RTP pacing and report rotation. Browser PLI can request a WhatsApp peer
 keyframe through the existing encrypted SRTCP data channel. Keep this fork
 pinned and compare changes with that upstream revision when updating it.
+
+The engine also samples numeric relay transport metadata while a call is
+active: SCTP smoothed RTT, DataChannel buffered bytes, and sent/received byte
+counters. The live-call hook is removed when the media channel closes; it does
+not expose relay addresses, identifiers, or packet contents.

@@ -202,6 +202,7 @@ func (r *Runtime) addLocalTracks(call *liveCall, pc *webrtc.PeerConnection) erro
 	if attachAudio {
 		outbound := &audioPCMAccumulator{}
 		call.call.Receive(meowcaller.SinkFunc(func(pcm []float32) {
+			processStarted := time.Now()
 			var encodedPackets [][]byte
 			call.codecMu.Lock()
 			if call.audioCodec == nil {
@@ -227,21 +228,27 @@ func (r *Runtime) addLocalTracks(call *liveCall, pc *webrtc.PeerConnection) erro
 				return
 			}
 			if len(encodedPackets) == 0 {
+				call.mediaDiagnostics.recordSink(time.Since(processStarted), 0)
 				return
 			}
+			processDuration := time.Since(processStarted)
 			call.mu.Lock()
 			currentAudio := call.audioTrack
 			call.mu.Unlock()
+			var writeDuration time.Duration
 			if currentAudio != nil {
+				writeStarted := time.Now()
 				for _, encoded := range encodedPackets {
 					if writeErr := currentAudio.WriteSample(media.Sample{Data: encoded, Duration: callAudioSampleDuration}); writeErr != nil {
 						r.failMedia(call, "media_failed")
 						return
 					}
 				}
+				writeDuration = time.Since(writeStarted)
 			}
+			call.mediaDiagnostics.recordSink(processDuration, writeDuration)
 		}))
-		call.call.Play(&browserAudioSource{frames: call.audioIn})
+		call.call.Play(&browserAudioSource{frames: call.audioIn, stats: &call.mediaDiagnostics.browserPCMQueue})
 	}
 	if call.envelope.Media == MediaVideo {
 		video, trackErr := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"}, "video", "whatsapp")
@@ -280,16 +287,22 @@ func (a *audioPCMAccumulator) Push(samples []float32) [][]float32 {
 	return frames
 }
 
-type browserAudioSource struct{ frames <-chan []float32 }
+type browserAudioSource struct {
+	frames <-chan queuedAudioFrame
+	stats  *mediaQueueDiagnostics
+}
 
 func (s *browserAudioSource) ReadFrame() ([]float32, error) {
 	frame := make([]float32, callAudioFrame)
+	s.stats.mu.Lock()
+	defer s.stats.mu.Unlock()
 	select {
-	case samples, ok := <-s.frames:
+	case item, ok := <-s.frames:
 		if !ok {
 			return nil, errors.New("browser audio source closed")
 		}
-		copy(frame, samples)
+		copy(frame, item.samples)
+		s.stats.popLocked(len(s.frames), item.enqueuedAt)
 	default:
 	}
 	return frame, nil
@@ -317,7 +330,7 @@ func (r *Runtime) readBrowserAudio(call *liveCall, track *webrtc.TrackRemote) {
 	}
 	defer decoder.Close()
 	reorder := newOpusRTPReorder(maxAudioReorderPackets)
-	packetCh := make(chan *rtp.Packet, 32)
+	packetCh := make(chan queuedRTPPacket, 32)
 	errCh := make(chan error, 1)
 	go func() {
 		for {
@@ -326,12 +339,18 @@ func (r *Runtime) readBrowserAudio(call *liveCall, track *webrtc.TrackRemote) {
 				errCh <- readErr
 				return
 			}
+			queued := queuedRTPPacket{packet: packet, enqueuedAt: time.Now()}
+			stats := &call.mediaDiagnostics.browserRTPQueue
+			stats.mu.Lock()
 			select {
-			case packetCh <- packet:
+			case packetCh <- queued:
+				stats.pushLocked(len(packetCh), false)
 			default:
+				stats.pushLocked(len(packetCh), true)
 				// A full local queue is treated as packet loss. The sequence gap
 				// will be concealed by the ordered decoder below.
 			}
+			stats.mu.Unlock()
 		}
 	}()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -348,8 +367,12 @@ func (r *Runtime) readBrowserAudio(call *liveCall, track *webrtc.TrackRemote) {
 	}
 	for {
 		select {
-		case packet := <-packetCh:
-			if !processReady(reorder.Push(packet, time.Now()), process) {
+		case queued := <-packetCh:
+			stats := &call.mediaDiagnostics.browserRTPQueue
+			stats.mu.Lock()
+			stats.popLocked(len(packetCh), queued.enqueuedAt)
+			stats.mu.Unlock()
+			if !processReady(reorder.Push(queued.packet, time.Now()), process) {
 				return
 			}
 		case <-ticker.C:
@@ -421,19 +444,27 @@ func (ingress *browserOpusIngress) popFrames() [][]float32 {
 }
 
 func queueAudioFrames(call *liveCall, frames [][]float32) {
+	stats := &call.mediaDiagnostics.browserPCMQueue
 	for _, frame := range frames {
+		queued := queuedAudioFrame{samples: frame, enqueuedAt: time.Now()}
+		stats.mu.Lock()
 		select {
-		case call.audioIn <- frame:
+		case call.audioIn <- queued:
+			stats.pushLocked(len(call.audioIn), false)
 		default:
 			select {
 			case <-call.audioIn:
+				stats.pushLocked(len(call.audioIn), true)
 			default:
 			}
 			select {
-			case call.audioIn <- frame:
+			case call.audioIn <- queued:
+				stats.pushLocked(len(call.audioIn), false)
 			default:
+				stats.pushLocked(len(call.audioIn), true)
 			}
 		}
+		stats.mu.Unlock()
 	}
 }
 

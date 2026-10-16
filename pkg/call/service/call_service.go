@@ -23,7 +23,7 @@ type CallService interface {
 	Current(instance *instance_model.Instance) (CallEnvelope, bool)
 	Offer(data *OfferCallStruct, instance *instance_model.Instance) (string, error)
 	Candidate(data *CandidateCallStruct, instance *instance_model.Instance) error
-	Heartbeat(data *ControlCallStruct, instance *instance_model.Instance) error
+	Heartbeat(data *HeartbeatCallStruct, instance *instance_model.Instance) error
 	ICEConfig(instance *instance_model.Instance) (ICEConfig, error)
 	DeploymentDrain(data *DrainRequest) (DrainStatus, error)
 }
@@ -49,6 +49,31 @@ type AnswerCallStruct struct {
 type ControlCallStruct struct {
 	CallID       string `json:"callId" binding:"required"`
 	ControllerID string `json:"controllerId" binding:"required"`
+}
+
+type HeartbeatCallStruct struct {
+	CallID            string             `json:"callId" binding:"required"`
+	ControllerID      string             `json:"controllerId" binding:"required"`
+	BrowserMediaStats *BrowserMediaStats `json:"browserMediaStats,omitempty"`
+}
+
+type BrowserMediaStats struct {
+	Transport    *BrowserTransportStats    `json:"transport,omitempty"`
+	InboundAudio *BrowserInboundAudioStats `json:"inboundAudio,omitempty"`
+}
+
+type BrowserTransportStats struct {
+	LocalCandidateType string   `json:"localCandidateType,omitempty"`
+	LocalProtocol      string   `json:"localProtocol,omitempty"`
+	RelayProtocol      string   `json:"relayProtocol,omitempty"`
+	CurrentRoundTripMs *float64 `json:"currentRoundTripMs,omitempty"`
+}
+
+type BrowserInboundAudioStats struct {
+	AverageJitterBufferMs *float64 `json:"averageJitterBufferMs,omitempty"`
+	PacketsLost           *int64   `json:"packetsLost,omitempty"`
+	PacketsReceived       *uint64  `json:"packetsReceived,omitempty"`
+	JitterMs              *float64 `json:"jitterMs,omitempty"`
 }
 
 type RejectCallStruct struct {
@@ -122,6 +147,10 @@ func (c *callService) Current(instance *instance_model.Instance) (CallEnvelope, 
 	return c.runtime.Snapshot(instance.Id)
 }
 
+func (c *callService) CurrentMediaDiagnostics(instance *instance_model.Instance, expectedCallID string) (CallMediaDiagnostics, bool) {
+	return c.runtime.CurrentMediaDiagnostics(instance.Id, expectedCallID)
+}
+
 func (c *callService) Offer(data *OfferCallStruct, instance *instance_model.Instance) (string, error) {
 	if data == nil {
 		return "", errors.New("call offer is required")
@@ -140,11 +169,11 @@ func ICECandidateInit(data *CandidateCallStruct) webrtc.ICECandidateInit {
 	return webrtc.ICECandidateInit{Candidate: data.Candidate, SDPMid: data.SDPMid, SDPMLineIndex: data.SDPMLine, UsernameFragment: data.UsernameFragment}
 }
 
-func (c *callService) Heartbeat(data *ControlCallStruct, instance *instance_model.Instance) error {
+func (c *callService) Heartbeat(data *HeartbeatCallStruct, instance *instance_model.Instance) error {
 	if data == nil {
 		return errors.New("call heartbeat is required")
 	}
-	return c.runtime.Heartbeat(instance.Id, data.CallID, data.ControllerID)
+	return c.runtime.Heartbeat(instance.Id, data.CallID, data.ControllerID, data.BrowserMediaStats)
 }
 
 func (c *callService) ICEConfig(instance *instance_model.Instance) (ICEConfig, error) {

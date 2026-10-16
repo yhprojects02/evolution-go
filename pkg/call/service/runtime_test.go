@@ -2,6 +2,7 @@ package call_service
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
@@ -628,6 +629,37 @@ func TestPionUDPMuxLoopbackCarriesRTP(t *testing.T) {
 	case <-connected:
 	case <-time.After(8 * time.Second):
 		t.Fatalf("Pion loopback did not connect (browser=%s server=%s); browser SDP:\n%s\nserver SDP:\n%s", browser.ConnectionState(), server.ConnectionState(), browser.LocalDescription().SDP, server.LocalDescription().SDP)
+	}
+	path := pionPathDiagnostics(server)
+	if !path.Available || path.LocalCandidateType == "" || path.RemoteCandidateType == "" || path.LocalProtocol == "" || path.RemoteProtocol == "" {
+		t.Fatalf("connected loopback did not expose selected Pion path: %+v", path)
+	}
+	if path.CurrentRoundTripMs != nil && *path.CurrentRoundTripMs <= 0 {
+		t.Fatalf("reported nonpositive Pion RTT: %+v", path)
+	}
+	iceTransport := server.SCTP().Transport().ICETransport()
+	selectedPair, pairErr := iceTransport.GetSelectedCandidatePair()
+	if pairErr != nil || selectedPair == nil {
+		t.Fatalf("Pion did not provide its selected candidate pair: pair=%v err=%v", selectedPair, pairErr)
+	}
+	withoutRTT := pionPathDiagnosticsFromPair(selectedPair, webrtc.ICECandidatePairStats{}, false)
+	if withoutRTT.CurrentRoundTripMs != nil {
+		t.Fatalf("default pair stats were reported as a measured RTT: %+v", withoutRTT)
+	}
+	encodedPath, marshalErr := json.Marshal(path)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	var pathFields map[string]json.RawMessage
+	if err = json.Unmarshal(encodedPath, &pathFields); err != nil {
+		t.Fatal(err)
+	}
+	for key := range pathFields {
+		switch key {
+		case "available", "currentRoundTripMs", "localCandidateType", "remoteCandidateType", "localProtocol", "remoteProtocol":
+		default:
+			t.Fatalf("Pion path exposed unexpected detail field %q: %s", key, encodedPath)
+		}
 	}
 	serverSSRC := uint32(serverVideoSender.GetParameters().Encodings[0].SSRC)
 	if err = browser.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: serverSSRC}}); err != nil {

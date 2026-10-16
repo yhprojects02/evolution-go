@@ -125,7 +125,15 @@ func (g *callHandler) Current(ctx *gin.Context) {
 		return
 	}
 	if result, found := g.callService.Current(instance); found {
-		ctx.JSON(http.StatusOK, gin.H{"call": result})
+		response := gin.H{"call": result}
+		if sampler, ok := g.callService.(interface {
+			CurrentMediaDiagnostics(*instance_model.Instance, string) (call_service.CallMediaDiagnostics, bool)
+		}); ok {
+			if diagnostics, available := sampler.CurrentMediaDiagnostics(instance, result.CallID); available {
+				response["mediaDiagnostics"] = diagnostics
+			}
+		}
+		ctx.JSON(http.StatusOK, response)
 		return
 	}
 	ctx.JSON(http.StatusOK, gin.H{"call": nil})
@@ -167,7 +175,7 @@ func (g *callHandler) Candidate(ctx *gin.Context) {
 }
 
 func (g *callHandler) Heartbeat(ctx *gin.Context) {
-	var data call_service.ControlCallStruct
+	var data call_service.HeartbeatCallStruct
 	if err := ctx.ShouldBindJSON(&data); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

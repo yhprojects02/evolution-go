@@ -33,6 +33,7 @@ type Call struct {
 	onParticipantVideoFrame   func(ParticipantVideoFrame)
 	onReaction                func(CallReaction)
 	groupState                *GroupCallState
+	mediaTransportDiagnostics func() (MediaTransportDiagnostics, bool)
 	onGroupState              func(GroupCallState)
 	groupCallbackGeneration   uint64
 	waitingRoomState          *WaitingRoomState
@@ -46,6 +47,33 @@ type Call struct {
 	handRaises                map[types.JID]bool
 	onScreenShare             func(ScreenShareState)
 	screenShares              map[types.JID]ScreenShareState
+}
+
+// MediaTransportDiagnostics contains content-free live relay transport values.
+type MediaTransportDiagnostics struct {
+	Available           bool     `json:"available"`
+	SRTTMs              *float64 `json:"srttMs,omitempty"`
+	BufferedAmountBytes uint64   `json:"bufferedAmountBytes"`
+	BytesSent           uint64   `json:"bytesSent"`
+	BytesReceived       uint64   `json:"bytesReceived"`
+}
+
+// SetMediaTransportDiagnostics installs the active media transport sampler.
+func (c *Call) SetMediaTransportDiagnostics(sampler func() (MediaTransportDiagnostics, bool)) {
+	c.mu.Lock()
+	c.mediaTransportDiagnostics = sampler
+	c.mu.Unlock()
+}
+
+// CurrentMediaTransportDiagnostics returns a snapshot when media transport is live.
+func (c *Call) CurrentMediaTransportDiagnostics() (MediaTransportDiagnostics, bool) {
+	c.mu.Lock()
+	sampler := c.mediaTransportDiagnostics
+	c.mu.Unlock()
+	if sampler == nil {
+		return MediaTransportDiagnostics{}, false
+	}
+	return sampler()
 }
 
 // GroupCallState is a sanitized group-call roster. Transaction zero may contain

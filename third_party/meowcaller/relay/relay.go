@@ -82,6 +82,15 @@ type RelayMediaChannel struct {
 	log      zerolog.Logger
 }
 
+// MediaTransportDiagnostics returns numeric transport counters only; it omits
+// relay addresses, stream identifiers, and call data.
+func (c *RelayMediaChannel) MediaTransportDiagnostics() (srttMs float64, bufferedBytes, bytesSent, bytesReceived uint64) {
+	if c == nil || c.assoc == nil || c.dc == nil {
+		return 0, 0, 0, 0
+	}
+	return c.assoc.SRTT(), c.dc.BufferedAmount(), c.dc.BytesSent(), c.dc.BytesReceived()
+}
+
 // Close tears down the media stack in reverse order of construction.
 func (c *RelayMediaChannel) Close() error {
 	c.log.Debug().Msg("tearing down relay media channel")

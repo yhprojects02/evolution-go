@@ -224,7 +224,18 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err != nil {
 		return err
 	}
-	defer ch.Close()
+	call.SetMediaTransportDiagnostics(func() (MediaTransportDiagnostics, bool) {
+		srtt, buffered, sent, received := ch.MediaTransportDiagnostics()
+		var srttMs *float64
+		if srtt > 0 && !math.IsNaN(srtt) && !math.IsInf(srtt, 0) {
+			srttMs = &srtt
+		}
+		return MediaTransportDiagnostics{Available: true, SRTTMs: srttMs, BufferedAmountBytes: buffered, BytesSent: sent, BytesReceived: received}, true
+	})
+	defer func() {
+		call.SetMediaTransportDiagnostics(nil)
+		_ = ch.Close()
+	}()
 	allocateState := newGroupRelayAllocateStateWithHBHFEC(
 		allocate,
 		rd.relayKeyASCII,
